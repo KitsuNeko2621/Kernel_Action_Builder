@@ -56,6 +56,9 @@ jobs:
     steps:
       - name: Checkout Workflow Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Set up Build Environment
         run: |
