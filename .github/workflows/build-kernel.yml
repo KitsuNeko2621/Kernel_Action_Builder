@@ -242,13 +242,13 @@ jobs:
         working-directory: kernel
         run: |
           if [ "${{ github.event.inputs.enable_susfs }}" == "true" ]; then
-            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-            echo "SUSFS_ENABLED=true"               >> $GITHUB_ENV
-            echo "KSU_BRANCH=builtin"            >> $GITHUB_ENV
-          else
             curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+            echo "SUSFS_ENABLED=true"               >> $GITHUB_ENV
+            echo "KSU_BRANCH=main"            >> $GITHUB_ENV
+          else
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
             echo "SUSFS_ENABLED=false"              >> $GITHUB_ENV
-            echo "KSU_BRANCH=main"               >> $GITHUB_ENV
+            echo "KSU_BRANCH=builtin"               >> $GITHUB_ENV
           fi
           echo "KSU_VARIANT=SukiSU"                                         >> $GITHUB_ENV
           echo "KSU_REPO=https://github.com/SukiSU-Ultra/SukiSU-Ultra"     >> $GITHUB_ENV
