@@ -57,11 +57,11 @@ jobs:
       USE_CCACHE: 1
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      KERNEL_REPO: "https://github.com/elohim-etz/android_kernel_realme_mt6785.git"
+      KERNEL_REPO: "https://github.com/KitsuNeko2001/kernel_realme_wasabi.git"
       CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r498229.git"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AK3.git"
       ANYKERNEL_BRANCH: "mikuchan"
-      DEFCONFIG: "RM6785_defconfig"
+      DEFCONFIG: "wasabi_defconfig"
 
     steps:
       # ── 0. Notify Telegram: Build Started ────────────────────────────────────
@@ -351,18 +351,18 @@ jobs:
           if [ "${{ github.event.inputs.enable_ksu }}" == "true" ]; then
             if [ "${SUSFS_ENABLED}" == "true" ]; then
               if [ "${SUSFS_DRIVER_MODE}" == "no_ksu_driver" ]; then
-                ZIP_NAME="Miku-RM6785-${KSU_VARIANT}-SUSFS_NoDriver-${TIMESTAMP}"
+                ZIP_NAME="KitsuNeko-RM6785-${KSU_VARIANT}-SUSFS_NoDriver-${TIMESTAMP}"
               else
-                ZIP_NAME="Miku-RM6785-${KSU_VARIANT}-SUSFS-${TIMESTAMP}"
+                ZIP_NAME="KitsuNeko-RM6785-${KSU_VARIANT}-SUSFS-${TIMESTAMP}"
               fi
             else
-              ZIP_NAME="Miku-RM6785-${KSU_VARIANT}-${TIMESTAMP}"
+              ZIP_NAME="KitsuNeko-RM6785-${KSU_VARIANT}-${TIMESTAMP}"
             fi
           elif [ "${{ github.event.inputs.enable_susfs }}" == "true" ]; then
             # Standalone SUSFS without any KSU driver
-            ZIP_NAME="Miku-RM6785-SUSFS_Standalone-${TIMESTAMP}"
+            ZIP_NAME="KitsuNeko-RM6785-SUSFS_Standalone-${TIMESTAMP}"
           else
-            ZIP_NAME="Miku-RM6785-Stock-${TIMESTAMP}"
+            ZIP_NAME="KitsuNeko-RM6785-Stock-${TIMESTAMP}"
           fi
 
           zip -r9 "${ZIP_NAME}.zip" . -x '*.git*' > /dev/null 2>&1
