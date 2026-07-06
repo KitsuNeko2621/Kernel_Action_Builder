@@ -57,11 +57,11 @@ jobs:
       USE_CCACHE: 1
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      KERNEL_REPO: "https://github.com/AbzRaider/kernel_realme_RM6785.git"
+      KERNEL_REPO: "https://github.com/KitsuNeko2001/android_kernel_realme_mt6785"
       CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r498229.git"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AK3.git"
       ANYKERNEL_BRANCH: "mikuchan"
-      DEFCONFIG: "wasabi_defconfig"
+      DEFCONFIG: "RM6785_defconfig"
 
     steps:
       # ── 0. Notify Telegram: Build Started ────────────────────────────────────
