@@ -61,7 +61,7 @@ jobs:
       CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r498229.git"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AK3.git"
       ANYKERNEL_BRANCH: "mikuchan"
-      DEFCONFIG: "RM6785_defconfig"
+      DEFCONFIG: "wasabi_defconfig"
 
     steps:
       # ── 0. Notify Telegram: Build Started ────────────────────────────────────
