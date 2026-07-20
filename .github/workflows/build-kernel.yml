@@ -176,12 +176,12 @@ jobs:
         id: cache-clang
         with:
           path: clang
-          key: clang-r547379
+          key: clang-16.0.6
 
       - name: Clone Clang Toolchain
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
-          wget --quiet "$CLANG_REPO" "Clang-16.0.6-20260716.tar.gz" mkdir clang && tar -xf Clang-16.0.6-20260716.tar.gz -C clang && rm -rf Clang-16.0.6-20260716.tar.gz
+          wget --quiet https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260716-release/Clang-16.0.6-20260716.tar.gz "Clang-16.0.6-20260716.tar.gz" mkdir clang && tar -xf Clang-16.0.6-20260716.tar.gz -C clang && rm -rf Clang-16.0.6-20260716.tar.gz
 
       # ── 6. AnyKernel3 ──────────────────────────────────────────────────────────
       - name: Cache AnyKernel3
