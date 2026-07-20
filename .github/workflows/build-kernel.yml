@@ -181,7 +181,7 @@ jobs:
       - name: Clone Clang Toolchain
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
-          git clone --depth=1 "$CLANG_REPO" clang
+          wget --quiet "$CLANG_REPO" "Clang-16.0.6-20260716.tar.gz" mkdir clang && tar -xf Clang-16.0.6-20260716.tar.gz -C clang && rm -rf Clang-16.0.6-20260716.tar.gz
 
       # ── 6. AnyKernel3 ──────────────────────────────────────────────────────────
       - name: Cache AnyKernel3
