@@ -58,7 +58,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       KERNEL_REPO: "https://github.com/KitsuNeko2621/android_kernel_realme_RMX2001.git"
-      CLANG_REPO: "https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260807-release/Clang-16.0.6-20260807.tar.gz"
+      CLANG_REPO: "https://github.com/kdrag0n/proton-clang.git"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AK3.git"
       ANYKERNEL_BRANCH: "mikuchan"
       DEFCONFIG: "RMX2001_defconfig"
@@ -176,13 +176,12 @@ jobs:
         id: cache-clang
         with:
           path: clang
-          key: clang-16.0.6
+          key: proton-clang
 
       - name: Clone Clang Toolchain
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
-          wget -q https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260716-release/Clang-16.0.6-20260716.tar.gz -O "weebx-clang.tar.gz" && rm -rf clang && mkdir clang && tar -xvf weebx-clang.tar.gz -C clang && rm -rf weebx-clang.tar.gz
-
+          git clone --depth=1 "$CLANG_REPO" clang
       # ── 6. AnyKernel3 ──────────────────────────────────────────────────────────
       - name: Cache AnyKernel3
         uses: actions/cache@v4
