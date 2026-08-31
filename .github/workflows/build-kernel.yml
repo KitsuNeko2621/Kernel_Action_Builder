@@ -57,11 +57,11 @@ jobs:
       USE_CCACHE: 1
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      KERNEL_REPO: "https://github.com/KitsuNeko2621/android_kernel_realme_mt6785_Elohim.git"
+      KERNEL_REPO: "https://github.com/KitsuNeko2621/android_kernel_realme_RMX2001.git"
       CLANG_REPO: "https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260807-release/Clang-16.0.6-20260807.tar.gz"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AK3.git"
       ANYKERNEL_BRANCH: "mikuchan"
-      DEFCONFIG: "RM6785_defconfig"
+      DEFCONFIG: "RMX2001_defconfig"
 
     steps:
       # ── 0. Notify Telegram: Build Started ────────────────────────────────────
