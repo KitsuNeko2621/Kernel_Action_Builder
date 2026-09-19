@@ -12,7 +12,7 @@ on:
         description: 'Kernel Branch'
         required: true
         type: string
-        default: 'lineage-24.0'
+        default: 'lineage-23.2'
       defconfig:
         description: 'Defconfig name (e.g. RM6785_defconfig)'
         required: true
