@@ -119,14 +119,6 @@ jobs:
         run: bash .github/scripts/clone_kernel.sh
 
       # ── Clang toolchain ──────────────────────────────────────────────────
-      - name: Cache AOSP Clang Toolchain
-        if: github.event.inputs.clang_toolchain == 'AOSP'
-        uses: actions/cache@v4
-        id: cache-clang
-        with:
-          path: clang
-          key: clang-greenforce-17.0.6-24122023
-
       - name: Clone AOSP Clang Toolchain
         if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
         run: |
