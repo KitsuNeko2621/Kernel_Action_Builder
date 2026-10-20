@@ -51,6 +51,25 @@ case "${KSU_VARIANT_INPUT}" in
     curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
     KSU_BRANCH="legacy"; SUSFS="false"
     KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next"
+    # The kernel's manual hooks (fs/stat.c, fs/read_write.c, drivers/input/input.c) reference
+    # static keys / a fstat helper that KernelSU-Next legacy does not define -> undefined
+    # symbol at link time. Provide them here. Next gates its own handlers with its internal
+    # flags (ksu_init_rc_hook / ksu_input_hook), so always-on keys are harmless.
+    cat > KernelSU/kernel/compat_baka_hooks.c << 'EOC'
+#include <linux/jump_label.h>
+#include <linux/types.h>
+
+DEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);
+DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);
+
+void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
+{
+}
+EOC
+    if ! grep -q "compat_baka_hooks.o" KernelSU/kernel/Kbuild; then
+      echo "kernelsu-objs += compat_baka_hooks.o" >> KernelSU/kernel/Kbuild
+    fi
+    echo "[+] Added compat hooks shim for KernelSU-Next."
     if [ "${ENABLE_SUSFS}" == "true" ]; then
       echo "::warning::KernelSU-Next legacy branch has no SUSFS integration here — flag ignored."
     fi
