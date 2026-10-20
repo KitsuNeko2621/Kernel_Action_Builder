@@ -1,0 +1,195 @@
+name: Build Kernel (Universal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel Repository URL'
+        required: true
+        type: string
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785_Elohim.git'
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        type: string
+        default: 'lineage-24.0'
+      defconfig:
+        description: 'Defconfig name (e.g. RM6785_defconfig)'
+        required: true
+        type: string
+        default: 'RM6785_defconfig'
+      private_repo_token:
+        description: 'GitHub Token (only if kernel repo is private)'
+        required: false
+        type: string
+        default: ''
+      enable_ksu:
+        description: 'Enable KernelSU'
+        required: true
+        type: boolean
+        default: false
+      ksu_variant:
+        description: 'KernelSU Variant (only if KSU enabled)'
+        required: false
+        type: choice
+        options:
+          - 'xxKSU'
+          - 'SukiSU'
+          - 'BakaSU'
+        default: 'BakaSU'
+      enable_susfs:
+        description: 'Enable SUSFS'
+        required: false
+        type: boolean
+        default: false
+      custom_note:
+        description: 'Custom build note (optional)'
+        required: false
+        default: ''
+      zip_name:
+        description: 'Kernel ZIP name prefix'
+        required: false
+        type: string
+        default: 'Miku'
+      clang_toolchain:
+        description: 'Clang Toolchain'
+        required: true
+        type: choice
+        options:
+          - 'AOSP'
+          - 'Neutron'
+        default: 'AOSP'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      LC_ALL: C
+      USE_CCACHE: 1
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      CLANG_REPO: "https://github.com/greenforce-project/greenforce_clang/releases/download/24122023/greenforce-clang-17.0.6-24122023-0137.tar.zst"
+      ANYKERNEL_REPO: "https://github.com/elohim-etz/AnyKernel3.git"
+      ANYKERNEL_BRANCH: "master"
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # ── Build environment ─────────────────────────────────────────────────
+      - name: Set up Build Environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev \
+            gcc clang lld libncurses5-dev git zip unzip \
+            curl wget time ccache libelf-dev libfdt-dev \
+            python3 python3-pip
+
+      # ── ccache ───────────────────────────────────────────────
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-kernel-${{ github.run_id }}
+          restore-keys: |
+            ccache-kernel-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=5G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=1
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      # ── Kernel source ─────────────────────────────────────────────────────
+      - name: Clone Kernel Source
+        env:
+          INPUT_KERNEL_REPO:   ${{ github.event.inputs.kernel_repo }}
+          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+          INPUT_PRIVATE_TOKEN: ${{ github.event.inputs.private_repo_token }}
+          INPUT_DEFCONFIG:     ${{ github.event.inputs.defconfig }}
+        run: bash .github/scripts/clone_kernel.sh
+
+      # ── Clang toolchain ──────────────────────────────────────────────────
+      - name: Cache AOSP Clang Toolchain
+        if: github.event.inputs.clang_toolchain == 'AOSP'
+        uses: actions/cache@v4
+        id: cache-clang
+        with:
+          path: clang
+          key: clang-r547379
+
+      - name: Clone AOSP Clang Toolchain
+        if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
+        run: wget "$(curl -s https://github.com/greenforce-project/greenforce_clang/releases/download/24122023/greenforce-clang-17.0.6-24122023-0137.tar.zst" -O "weebx-clang.tar.gz"
+rm -rf clang && mkdir clang && tar -xvf weebx-clang.tar.gz -C clang && rm -rf weebx-clang.tar.gz
+
+      - name: Setup Clang Toolchain
+        env:
+          INPUT_CLANG_TOOLCHAIN: ${{ github.event.inputs.clang_toolchain }}
+        run: bash .github/scripts/setup_toolchain.sh
+
+      # ── AnyKernel3 ─────────────────────────
+      - name: Clone AnyKernel3
+        run: git clone --depth=1 "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH" AnyKernel
+
+      # ── KernelSU / variant selection ──────────────────────────────────────
+      - name: Setup KernelSU / Build Variant
+        env:
+          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
+          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
+        run: bash .github/scripts/setup_ksu.sh
+
+      # ── Logs ─────────────────────────────────────────────────────────────
+      - name: Prepare Log Paths
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          echo "BUILD_LOG=$GITHUB_WORKSPACE/logs/build.log"   >> $GITHUB_ENV
+          echo "ERROR_LOG=$GITHUB_WORKSPACE/logs/errors.log"  >> $GITHUB_ENV
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build Kernel
+        run: bash .github/scripts/build_kernel.sh
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            ${{ env.BUILD_LOG }}
+            ${{ env.ERROR_LOG }}
+          retention-days: 7
+
+      - name: Check Build Output
+        run: bash .github/scripts/check_output.sh
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package with AnyKernel3
+        env:
+          ZIP_NAME_PREFIX: ${{ github.event.inputs.zip_name }}
+        run: bash .github/scripts/package_zip.sh
+
+      # ── Telegram notifications ────────────────────────────────────────────
+      - name: Send Kernel ZIP to Telegram
+        if: success()
+        env:
+          CUSTOM_NOTE: ${{ github.event.inputs.custom_note }}
+        run: bash .github/scripts/notify_success.sh
+
+      - name: Send Failure Notification to Telegram
+        if: failure()
+        env:
+          CUSTOM_NOTE:       ${{ github.event.inputs.custom_note }}
+          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
+          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
+          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+        run: bash .github/scripts/notify_failure.sh
