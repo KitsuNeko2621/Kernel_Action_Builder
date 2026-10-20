@@ -7,7 +7,7 @@ on:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/elohim-etz/android_kernel_realme_mt6785.git'
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785_Elohim.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
@@ -70,7 +70,7 @@ jobs:
       USE_CCACHE: 1
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git"
+      CLANG_REPO: "https://github.com/greenforce-project/greenforce_clang/releases/download/24122023/greenforce-clang-17.0.6-24122023-0137.tar.zst"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AnyKernel3.git"
       ANYKERNEL_BRANCH: "master"
     steps:
@@ -127,7 +127,8 @@ jobs:
 
       - name: Clone AOSP Clang Toolchain
         if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
-        run: git clone --depth=1 "$CLANG_REPO" clang
+        run: wget "$(curl -s https://github.com/greenforce-project/greenforce_clang/releases/download/24122023/greenforce-clang-17.0.6-24122023-0137.tar.zst" -O "weebx-clang.tar.gz"
+rm -rf clang && mkdir clang && tar -xvf weebx-clang.tar.gz -C clang && rm -rf weebx-clang.tar.gz
 
       - name: Setup Clang Toolchain
         env:
