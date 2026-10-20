@@ -119,19 +119,11 @@ jobs:
         run: bash .github/scripts/clone_kernel.sh
 
       # ── Clang toolchain ──────────────────────────────────────────────────
-      - name: Cache AOSP Clang Toolchain
+      - name: Download AOSP Clang Toolchain (always fresh)
         if: github.event.inputs.clang_toolchain == 'AOSP'
-        uses: actions/cache@v4
-        id: cache-clang
-        with:
-          path: clang
-          key: clang-greenforce-17.0.6-24122023
-
-      - name: Clone AOSP Clang Toolchain
-        if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
         run: |
+          rm -rf clang clang.tar.zst && mkdir clang
           wget -q "$CLANG_REPO" -O clang.tar.zst
-          rm -rf clang && mkdir clang
           tar --zstd -xf clang.tar.zst -C clang
           rm -f clang.tar.zst
           # Kalau isi tarball dibungkus 1 folder, ratakan supaya clang/bin/clang langsung ada
