@@ -37,6 +37,7 @@ on:
           - 'SukiSU'
           - 'BakaSU'
           - 'KernelSU-Next'
+          - 'KernelSU'
         default: 'BakaSU'
       enable_susfs:
         description: 'Enable SUSFS'
