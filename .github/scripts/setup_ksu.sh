@@ -37,6 +37,15 @@ case "${KSU_VARIANT_INPUT}" in
     KSU_BRANCH="main"
     KSU_REPO="https://github.com/Baka-SU/BakaSU"
     SUSFS="${ENABLE_SUSFS}"
+    if [ "${ENABLE_SUSFS}" == "true" ]; then
+      # BakaSU main (since 48fa4bb7, 2026-10-10) hard-fails the build when SUSFS is on.
+      # Pin to the last commit before that, so SUSFS builds keep working.
+      BAKASU_SUSFS_COMMIT="5b76b884c75f729a220bb317aa4a4fc78f0e0e9c"
+      git -C KernelSU fetch -q --unshallow 2>/dev/null || true
+      git -C KernelSU checkout -q "${BAKASU_SUSFS_COMMIT}"
+      KSU_BRANCH="${BAKASU_SUSFS_COMMIT:0:8}"
+      echo "[+] BakaSU pinned to ${BAKASU_SUSFS_COMMIT:0:8} for SUSFS."
+    fi
     ;;
   KernelSU-Next)
     curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
