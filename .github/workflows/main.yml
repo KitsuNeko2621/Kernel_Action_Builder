@@ -1,4 +1,4 @@
-name: Build Kernel (Universal)
+name: Build Kernel (GC17)
 
 on:
   workflow_dispatch:
