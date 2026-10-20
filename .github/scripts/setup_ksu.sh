@@ -55,7 +55,7 @@ case "${KSU_VARIANT_INPUT}" in
     # static keys / a fstat helper that KernelSU-Next legacy does not define -> undefined
     # symbol at link time. Provide them here. Next gates its own handlers with its internal
     # flags (ksu_init_rc_hook / ksu_input_hook), so always-on keys are harmless.
-    cat > KernelSU/kernel/compat_baka_hooks.c << 'EOC'
+    cat > KernelSU-Next/kernel/compat_baka_hooks.c << 'EOC'
 #include <linux/jump_label.h>
 #include <linux/types.h>
 
@@ -66,8 +66,8 @@ void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
 {
 }
 EOC
-    if ! grep -q "compat_baka_hooks.o" KernelSU/kernel/Kbuild; then
-      echo "kernelsu-objs += compat_baka_hooks.o" >> KernelSU/kernel/Kbuild
+    if ! grep -q "compat_baka_hooks.o" KernelSU-Next/kernel/Kbuild; then
+      echo "kernelsu-objs += compat_baka_hooks.o" >> KernelSU-Next/kernel/Kbuild
     fi
     echo "[+] Added compat hooks shim for KernelSU-Next."
     if [ "${ENABLE_SUSFS}" == "true" ]; then
