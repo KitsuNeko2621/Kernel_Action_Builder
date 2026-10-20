@@ -38,6 +38,18 @@ case "${KSU_VARIANT_INPUT}" in
     KSU_REPO="https://github.com/Baka-SU/BakaSU"
     SUSFS="${ENABLE_SUSFS}"
     ;;
+  KernelSU-Next)
+    curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.4.2/kernel/setup.sh" | bash -s v3.4.2
+    KSU_BRANCH="v3.4.2"; SUSFS="false"
+    KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next"
+    if [ "${ENABLE_SUSFS}" == "true" ]; then
+      echo "::warning::KernelSU-Next is pinned to tag v3.4.2 — SUSFS flag ignored."
+    fi
+    ;;
+  *)
+    echo "::error::Unknown KSU variant: ${KSU_VARIANT_INPUT}"
+    exit 1
+    ;;
 esac
 
 if [ "${SUSFS}" == "true" ]; then
