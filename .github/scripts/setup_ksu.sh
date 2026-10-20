@@ -39,11 +39,19 @@ case "${KSU_VARIANT_INPUT}" in
     SUSFS="${ENABLE_SUSFS}"
     ;;
   KernelSU-Next)
-    curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.4.2/kernel/setup.sh" | bash -s v3.4.2
-    KSU_BRANCH="v3.4.2"; SUSFS="false"
+    curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+    KSU_BRANCH="legacy"; SUSFS="false"
     KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next"
     if [ "${ENABLE_SUSFS}" == "true" ]; then
-      echo "::warning::KernelSU-Next is pinned to tag v3.4.2 — SUSFS flag ignored."
+      echo "::warning::KernelSU-Next legacy branch has no SUSFS integration here — flag ignored."
+    fi
+    ;;
+  KernelSU)
+    curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+    KSU_BRANCH="main"; SUSFS="false"
+    KSU_REPO="https://github.com/tiann/KernelSU"
+    if [ "${ENABLE_SUSFS}" == "true" ]; then
+      echo "::warning::Original KernelSU has no built-in SUSFS support — flag ignored."
     fi
     ;;
   *)
