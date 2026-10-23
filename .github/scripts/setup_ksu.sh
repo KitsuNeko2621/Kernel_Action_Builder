@@ -38,13 +38,31 @@ case "${KSU_VARIANT_INPUT}" in
     KSU_REPO="https://github.com/Baka-SU/BakaSU"
     SUSFS="${ENABLE_SUSFS}"
     if [ "${ENABLE_SUSFS}" == "true" ]; then
-          # BakaSU main (since 48fa4bb7, 2026-10-10) hard-fails the build when SUSFS is on.
-      # Pin to the last commit before that, so SUSFS builds keep working.
+      # BakaSU main (since 48fa4bb7, 2026-10-10) has an unconditional
+      # $(error Please wait susfs update.) in kernel/tools/susfs_compat.mk, so SUSFS
+      # builds fail on main. Try the sync-susfs branch (gate removed there, per other
+      # kernel projects); if it still has the gate or cannot be fetched, fall back
+      # to the last good commit before the suspend.
+      BAKASU_SUSFS_REF="${BAKASU_SUSFS_REF:-sync-susfs}"
       BAKASU_SUSFS_COMMIT="5b76b884c75f729a220bb317aa4a4fc78f0e0e9c"
       git -C KernelSU fetch -q --unshallow 2>/dev/null || true
-      git -C KernelSU checkout -q "${BAKASU_SUSFS_COMMIT}"
-      KSU_BRANCH="${BAKASU_SUSFS_COMMIT:0:8}"
-      echo "[+] BakaSU pinned to ${BAKASU_SUSFS_COMMIT:0:8} for SUSFS."
+      USED_REF=""
+      if git -C KernelSU fetch -q origin "${BAKASU_SUSFS_REF}" 2>/dev/null \
+         && git -C KernelSU checkout -q FETCH_HEAD 2>/dev/null; then
+        if grep -q 'Please wait susfs update' KernelSU/kernel/tools/susfs_compat.mk 2>/dev/null; then
+          echo "::warning::BakaSU ${BAKASU_SUSFS_REF} still has the SUSFS build gate — falling back to pinned commit."
+        else
+          USED_REF="${BAKASU_SUSFS_REF}"
+        fi
+      else
+        echo "::warning::Could not fetch BakaSU ${BAKASU_SUSFS_REF} — falling back to pinned commit."
+      fi
+      if [ -z "${USED_REF}" ]; then
+        git -C KernelSU checkout -q "${BAKASU_SUSFS_COMMIT}"
+        USED_REF="${BAKASU_SUSFS_COMMIT}"
+      fi
+      KSU_BRANCH="$(git -C KernelSU rev-parse --short=8 HEAD)"
+      echo "[+] BakaSU for SUSFS: ${USED_REF} (${KSU_BRANCH})."
     fi
     ;;
   KernelSU-Next)
