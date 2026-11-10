@@ -231,6 +231,7 @@ jobs:
             ${{ env.BUILD_LOG }}
             ${{ env.ERROR_LOG }}
             ${{ github.workspace }}/logs/rej
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Check Build Output
@@ -258,3 +259,4 @@ jobs:
           ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
           INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
         run: bash .github/scripts/notify_failure.sh
+        
