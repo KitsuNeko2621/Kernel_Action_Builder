@@ -5,7 +5,7 @@ cd "${KERNEL_DIR}"
 start_time=$(date +%s)
 
 export PATH="${CLANG_PATH}:${PATH}"
-export KBUILD_BUILD_USER="elohim-etz"
+export KBUILD_BUILD_USER="KitsuNeko"
 export KBUILD_BUILD_HOST="GitHub-Actions"
 
 echo "=== Toolchain ==="
