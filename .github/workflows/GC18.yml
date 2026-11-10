@@ -159,13 +159,6 @@ jobs:
           echo "BUILD_LOG=$GITHUB_WORKSPACE/logs/build.log"   >> $GITHUB_ENV
           echo "ERROR_LOG=$GITHUB_WORKSPACE/logs/errors.log"  >> $GITHUB_ENV
 
-      # ── SUSFS (patch kernel + inline hook) ────────────────────────────────
-      - name: Patch SUSFS + Inline Hook
-        env:
-          ENABLE_KSU:    ${{ github.event.inputs.enable_ksu }}
-          ALLOW_REJECT:  ${{ github.event.inputs.susfs_allow_reject }}
-        run: bash .github/scripts/setup_susfs.sh
-
       # ── Build ─────────────────────────────────────────────────────────────
       - name: Build Kernel
         run: bash .github/scripts/build_kernel.sh
