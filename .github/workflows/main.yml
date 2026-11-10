@@ -7,12 +7,12 @@ on:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785_Elohim.git'
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-testnomount.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
         type: string
-        default: 'lineage-24.0'
+        default: 'main'
       defconfig:
         description: 'Defconfig name (e.g. RM6785_defconfig)'
         required: true
