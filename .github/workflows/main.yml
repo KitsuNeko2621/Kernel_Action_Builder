@@ -44,6 +44,16 @@ on:
         required: false
         type: boolean
         default: false
+      enable_nomount:
+        description: 'Enable NoMount'
+        required: false
+        type: boolean
+        default: true
+      nomount_ref:
+        description: 'NoMount branch/tag/commit (only if NoMount enabled)'
+        required: false
+        type: string
+        default: 'dev'
       custom_note:
         description: 'Custom build note (optional)'
         required: false
@@ -118,64 +128,38 @@ jobs:
           INPUT_DEFCONFIG:     ${{ github.event.inputs.defconfig }}
         run: bash .github/scripts/clone_kernel.sh
 
-      # ── NoMount submodule integration ─────────────────────────────────────
-      - name: Integrate NoMount submodule into fs
+      # ── NoMount (setup script, sama seperti KSU) ──────────────────────────
+      - name: Setup NoMount
+        if: github.event.inputs.enable_nomount == 'true'
         shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        env:
+          NOMOUNT_REF: ${{ github.event.inputs.nomount_ref }}
         run: |
           set -euo pipefail
 
-          # clone_kernel.sh in this workflow is expected to place the kernel tree here.
-          KERNEL_DIR="$GITHUB_WORKSPACE/kernel"
-          FS_DIR="$KERNEL_DIR/fs"
-
-          if [ ! -f "$KERNEL_DIR/Makefile" ] || [ ! -f "$FS_DIR/Kconfig" ] || [ ! -f "$FS_DIR/Makefile" ]; then
-            echo "::error::Kernel source tree was not found at $KERNEL_DIR. Check .github/scripts/clone_kernel.sh."
+          if [ ! -f Makefile ] || [ ! -d fs ]; then
+            echo "::error::Kernel source tree tidak ditemukan di $PWD. Cek .github/scripts/clone_kernel.sh."
             exit 1
           fi
 
-          # The kernel repository's submodules must be initialized separately;
-          # actions/checkout submodules only applies to the workflow repository.
-          git -C "$KERNEL_DIR" submodule sync --recursive
-          git -C "$KERNEL_DIR" submodule update --init --recursive
-
-          NOMOUNT_SRC=""
-          while IFS= read -r SUBMODULE_PATH; do
-            [ -n "$SUBMODULE_PATH" ] || continue
-            SUBMODULE_DIR="$KERNEL_DIR/$SUBMODULE_PATH"
-            [ -d "$SUBMODULE_DIR" ] || continue
-
-            # Find the directory in the submodule that contains the NoMount
-            # implementation and its own Kconfig/Makefile.
-            NOMOUNT_C_FILE="$(find "$SUBMODULE_DIR" -type f -name nomount.c -print -quit)"
-            [ -n "$NOMOUNT_C_FILE" ] || continue
-            CANDIDATE_DIR="$(dirname "$NOMOUNT_C_FILE")"
-
-            if [ -f "$CANDIDATE_DIR/Kconfig" ] && [ -f "$CANDIDATE_DIR/Makefile" ]; then
-              NOMOUNT_SRC="$CANDIDATE_DIR"
-              break
-            fi
-          done < <(git -C "$KERNEL_DIR" config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{print $2}')
-
-          if [ -z "$NOMOUNT_SRC" ]; then
-            echo "::error::NoMount submodule source not found. Expected a submodule directory containing nomount.c, Kconfig, and Makefile."
-            echo "Submodule status:"
-            git -C "$KERNEL_DIR" submodule status --recursive
-            exit 1
+          # Kalau kernel repo sudah punya fs/nomount sebagai folder biasa,
+          # hapus dulu, kalau tidak symlink akan dibuat DI DALAM folder itu.
+          if [ -d fs/nomount ] && [ ! -L fs/nomount ]; then
+            echo "Removing existing fs/nomount directory"
+            rm -rf fs/nomount
           fi
 
-          # Copy NoMount files into the existing fs/nomount directory.
-          cp -a "$NOMOUNT_SRC/." "$FS_DIR/nomount/"
+          NOMOUNT_REF="${NOMOUNT_REF:-dev}"
+          curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s -- "$NOMOUNT_REF"
 
-          # Ensure the top-level kernel Kconfig/Makefile reference NoMount.
-          grep -Fq 'source "fs/nomount/Kconfig"' "$FS_DIR/Kconfig" || \
-            printf '\nsource "fs/nomount/Kconfig"\n' >> "$FS_DIR/Kconfig"
+          # Verifikasi hasil setup
+          test -e fs/nomount/Kconfig || { echo "::error::NoMount setup gagal (fs/nomount/Kconfig tidak ada)"; exit 1; }
+          grep -q 'nomount' fs/Makefile || { echo "::error::fs/Makefile tidak memuat nomount"; exit 1; }
+          grep -q 'fs/nomount/Kconfig' fs/Kconfig || { echo "::error::fs/Kconfig tidak memuat nomount"; exit 1; }
 
-          grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' "$FS_DIR/Makefile" || \
-            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$FS_DIR/Makefile"
-
-          echo "NoMount source copied from: $NOMOUNT_SRC"
-          echo "Installed files:"
-          ls -la "$FS_DIR/nomount"
+          echo "NoMount installed:"
+          ls -la fs/nomount
 
       # ── Clang toolchain ──────────────────────────────────────────────────
       - name: Clone AOSP Clang Toolchain
