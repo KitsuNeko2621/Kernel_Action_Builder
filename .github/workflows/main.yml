@@ -163,15 +163,12 @@ jobs:
             exit 1
           fi
 
-          # Prepare destination safely if it already exists from a prior integration.
-          if [ -e "$FS_DIR/nomount" ]; then
-            if [ ! -d "$FS_DIR/nomount" ]; then
-              echo "::error::Destination $FS_DIR/nomount exists but is not a directory."
-              exit 1
-            fi
-          else
-            mkdir "$FS_DIR/nomount"
+          # Idempotent destination setup: mkdir -p is safe if it already exists.
+          if [ -e "$FS_DIR/nomount" ] && [ ! -d "$FS_DIR/nomount" ]; then
+            echo "::error::Destination $FS_DIR/nomount exists but is not a directory."
+            exit 1
           fi
+          mkdir -p "$FS_DIR/nomount"
           cp -a "$NOMOUNT_SRC/." "$FS_DIR/nomount/"
 
           # Ensure the top-level kernel Kconfig/Makefile reference NoMount.
