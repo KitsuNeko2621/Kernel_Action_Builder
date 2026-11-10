@@ -7,7 +7,7 @@ on:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-nomount.git'
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-testnomount.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
@@ -101,7 +101,8 @@ jobs:
             build-essential bc bison flex libssl-dev \
             gcc clang lld libncurses5-dev git zip unzip \
             curl wget time ccache libelf-dev libfdt-dev \
-            python3 python3-pip zstd
+            python3 python3-pip zstd \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       # ── ccache ───────────────────────────────────────────────
       - name: Cache ccache
