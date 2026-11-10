@@ -163,7 +163,15 @@ jobs:
             exit 1
           fi
 
-          mkdir -p "$FS_DIR/nomount"
+          # Prepare destination safely if it already exists from a prior integration.
+          if [ -e "$FS_DIR/nomount" ]; then
+            if [ ! -d "$FS_DIR/nomount" ]; then
+              echo "::error::Destination $FS_DIR/nomount exists but is not a directory."
+              exit 1
+            fi
+          else
+            mkdir "$FS_DIR/nomount"
+          fi
           cp -a "$NOMOUNT_SRC/." "$FS_DIR/nomount/"
 
           # Ensure the top-level kernel Kconfig/Makefile reference NoMount.
@@ -259,4 +267,3 @@ jobs:
           ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
           INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
         run: bash .github/scripts/notify_failure.sh
-        
