@@ -163,14 +163,7 @@ jobs:
             exit 1
           fi
 
-          # Avoid mkdir when fs/nomount already exists in the kernel source.
-          if [ -e "$FS_DIR/nomount" ] && [ ! -d "$FS_DIR/nomount" ]; then
-            echo "::error::Destination $FS_DIR/nomount exists but is not a directory."
-            exit 1
-          fi
-          if [ ! -d "$FS_DIR/nomount" ]; then
-            mkdir "$FS_DIR/nomount"
-          fi
+          # Copy NoMount files into the existing fs/nomount directory.
           cp -a "$NOMOUNT_SRC/." "$FS_DIR/nomount/"
 
           # Ensure the top-level kernel Kconfig/Makefile reference NoMount.
