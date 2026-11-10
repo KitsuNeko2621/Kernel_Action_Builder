@@ -7,7 +7,7 @@ on:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-testnomount.git'
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-nomount.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
