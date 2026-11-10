@@ -44,11 +44,6 @@ on:
         required: false
         type: boolean
         default: false
-      susfs_allow_reject:
-        description: 'Lanjut build walau patch SUSFS ada .rej (debug)'
-        required: false
-        type: boolean
-        default: false
       custom_note:
         description: 'Custom build note (optional)'
         required: false
