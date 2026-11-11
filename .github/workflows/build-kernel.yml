@@ -60,4 +60,187 @@ on:
         default: ''
       zip_name:
         description: 'Kernel ZIP name prefix'
+        required: false
+        type: string
+        default: 'Miku'
+      clang_toolchain:
+        description: 'Clang Toolchain'
+        required: true
+        type: choice
+        options:
+          - 'AOSP'
+          - 'Neutron'
+        default: 'AOSP'
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      LC_ALL: C
+      USE_CCACHE: 1
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      CLANG_REPO: "https://github.com/greenforce-project/greenforce_clang/releases/download/24122023/greenforce-clang-17.0.6-24122023-0137.tar.zst"
+      ANYKERNEL_REPO: "https://github.com/elohim-etz/AnyKernel3.git"
+      ANYKERNEL_BRANCH: "master"
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # ── Build environment ─────────────────────────────────────────────────
+      - name: Set up Build Environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev \
+            gcc clang lld libncurses5-dev git zip unzip \
+            curl wget time ccache libelf-dev libfdt-dev \
+            python3 python3-pip zstd \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      # ── ccache ───────────────────────────────────────────────
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-kernel-${{ github.run_id }}
+          restore-keys: |
+            ccache-kernel-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=5G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=1
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      # ── Kernel source ─────────────────────────────────────────────────────
+      - name: Clone Kernel Source
+        env:
+          INPUT_KERNEL_REPO:   ${{ github.event.inputs.kernel_repo }}
+          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+          INPUT_PRIVATE_TOKEN: ${{ github.event.inputs.private_repo_token }}
+          INPUT_DEFCONFIG:     ${{ github.event.inputs.defconfig }}
+        run: bash .github/scripts/clone_kernel.sh
+
+      # ── NoMount (setup script, sama seperti KSU) ──────────────────────────
+      - name: Setup NoMount
+        if: github.event.inputs.enable_nomount == 'true'
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        env:
+          NOMOUNT_REF: ${{ github.event.inputs.nomount_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f Makefile ] || [ ! -d fs ]; then
+            echo "::error::Kernel source tree tidak ditemukan di $PWD. Cek .github/scripts/clone_kernel.sh."
+            exit 1
+          fi
+
+          # Kalau kernel repo sudah punya fs/nomount sebagai folder biasa,
+          # hapus dulu, kalau tidak symlink akan dibuat DI DALAM folder itu.
+          if [ -d fs/nomount ] && [ ! -L fs/nomount ]; then
+            echo "Removing existing fs/nomount directory"
+            rm -rf fs/nomount
+          fi
+
+          NOMOUNT_REF="${NOMOUNT_REF:-dev}"
+          curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s -- "$NOMOUNT_REF"
+
+          # Verifikasi hasil setup
+          test -e fs/nomount/Kconfig || { echo "::error::NoMount setup gagal (fs/nomount/Kconfig tidak ada)"; exit 1; }
+          grep -q 'nomount' fs/Makefile || { echo "::error::fs/Makefile tidak memuat nomount"; exit 1; }
+          grep -q 'fs/nomount/Kconfig' fs/Kconfig || { echo "::error::fs/Kconfig tidak memuat nomount"; exit 1; }
+
+          echo "NoMount installed:"
+          ls -la fs/nomount
+
+      # ── Clang toolchain ──────────────────────────────────────────────────
+      - name: Clone AOSP Clang Toolchain
+        if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          wget -q "$CLANG_REPO" -O clang.tar.zst
+          rm -rf clang && mkdir clang
+          tar --zstd -xf clang.tar.zst -C clang
+          rm -f clang.tar.zst
+          # Kalau isi tarball dibungkus 1 folder, ratakan supaya clang/bin/clang langsung ada
+          if [ ! -d clang/bin ] && [ "$(ls -1 clang | wc -l)" -eq 1 ]; then
+            inner="$(ls -1 clang)"
+            mv "clang/$inner"/* clang/ 2>/dev/null || true
+            mv "clang/$inner"/.[!.]* clang/ 2>/dev/null || true
+            rmdir "clang/$inner" 2>/dev/null || true
+          fi
+          clang/bin/clang --version | head -n1
+
+      - name: Setup Clang Toolchain
+        env:
+          INPUT_CLANG_TOOLCHAIN: ${{ github.event.inputs.clang_toolchain }}
+        run: bash .github/scripts/setup_toolchain.sh
+
+      # ── AnyKernel3 ─────────────────────────
+      - name: Clone AnyKernel3
+        run: git clone --depth=1 "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH" AnyKernel
+
+      # ── KernelSU / variant selection ──────────────────────────────────────
+      - name: Setup KernelSU / Build Variant
+        env:
+          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
+          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
+        run: bash .github/scripts/setup_ksu.sh
+
+      # ── Logs ─────────────────────────────────────────────────────────────
+      - name: Prepare Log Paths
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          echo "BUILD_LOG=$GITHUB_WORKSPACE/logs/build.log"   >> $GITHUB_ENV
+          echo "ERROR_LOG=$GITHUB_WORKSPACE/logs/errors.log"  >> $GITHUB_ENV
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build Kernel
+        run: bash .github/scripts/build_kernel.sh
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            ${{ env.BUILD_LOG }}
+            ${{ env.ERROR_LOG }}
+            ${{ github.workspace }}/logs/rej
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Check Build Output
+        run: bash .github/scripts/check_output.sh
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package with AnyKernel3
+        env:
+          ZIP_NAME_PREFIX: ${{ github.event.inputs.zip_name }}
+        run: bash .github/scripts/package_zip.sh
+
+      # ── Telegram notifications ────────────────────────────────────────────
+      - name: Send Kernel ZIP to Telegram
+        if: success()
+        env:
+          CUSTOM_NOTE: ${{ github.event.inputs.custom_note }}
+        run: bash .github/scripts/notify_success.sh
+
+      - name: Send Failure Notification to Telegram
+        if: failure()
+        env:
+          CUSTOM_NOTE:       ${{ github.event.inputs.custom_note }}
+          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
+          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
+          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+        run: bash .github/scripts/notify_failure.sh
