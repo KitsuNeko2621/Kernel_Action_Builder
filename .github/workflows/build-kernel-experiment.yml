@@ -1,4 +1,4 @@
-name: Build Kernel Nemo (experiment)
+name: Build Kernel Nemo (NoMount)
 
 # Workflow mandiri: tidak memerlukan file lain di repo (.github/scripts, submodule, dsb).
 # Versi ini: membuat dtbo.img dari source (3 overlay nemo) dan ikut diflash lewat zip AnyKernel.
@@ -65,6 +65,11 @@ on:
         default: 'off'
       build_dtbo:
         description: 'Buat dtbo.img dari source (3 overlay nemo) dan ikut diflash lewat zip'
+        required: true
+        type: boolean
+        default: true
+      replace_dtb_section:
+        description: 'Ganti bagian DTB di boot.img dengan DTB build ini (diperlukan: bootloader memakai DTB boot.img, bukan yang menempel di kernel)'
         required: true
         type: boolean
         default: true
@@ -209,8 +214,13 @@ jobs:
           BUILD_DTBO="${BUILD_DTBO:-1}"
           DTBO_ENTRIES="${DTBO_ENTRIES:-mediatek/oppo6785_20682.dtbo:0 mediatek/oppo6785_20684.dtbo:1 mediatek/oppo6785_19661.dtbo:2}"
 
+          # 1 = ganti bagian DTB di boot.img (header v2) dengan mt6785.dtb hasil build ini.
+          #     Di ROM A13 lama, bootloader memakai DTB di boot.img (terlihat dari /proc/device-tree/shell_front),
+          #     bukan DTB yang menempel di Image.gz-dtb. Tanpa ini kernel 4.19 mendapat DTB 4.14 lama.
+          NEKO_REPLACE_DTB="${NEKO_REPLACE_DTB:-1}"
+
           # 1 = matikan LTO/CFI/ShadowCallStack di .config (kompilasi jauh lebih cepat, untuk tes)
-          DISABLE_LTO="${DISABLE_LTO:-0}"
+          NEKO_NO_LTO="${NEKO_NO_LTO:-0}"
 
           # --- Mode hemat RAM (cocok untuk RAM 4GB) ----------------------------------------
           # 1 = aktifkan: matikan DEBUG_INFO / SCHEDSTATS / KPROBES, perkecil log buffer kernel (128 KB),
@@ -861,7 +871,7 @@ jobs:
 
           # Matikan LTO/CFI (opsional) supaya kompilasi jauh lebih cepat. Hanya untuk build tes.
           apply_lto_config() {
-              [ "${DISABLE_LTO}" = "1" ] || return 0
+              [ "${NEKO_NO_LTO}" = "1" ] || return 0
               local cfg="${OUT_DIR}/.config" sc="${KERNEL_DIR}/scripts/config"
               log_info "Mematikan LTO/CFI/ShadowCallStack (build lebih cepat)"
               bash "${sc}" --file "${cfg}" -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_PERMISSIVE -d SHADOW_CALL_STACK
@@ -932,9 +942,8 @@ jobs:
 
           # Menulis anykernel.sh khusus RM6785 (boot only, tanpa contoh ramdisk "tuna" bawaan upstream)
           write_anykernel_sh() {
-              local f="$1" i=0 d devlines="" dtbolines=""
+              local f="$1" i=0 d devlines=""
               for d in ${AK_DEVICES}; do i=$((i + 1)); devlines+="device.name${i}=${d}"$'\n'; done
-              [ -n "${DTBO_IMG:-}" ] && dtbolines="flash_generic dtbo;"
               cat > "${f}" <<EOF
           ### AnyKernel3 Ramdisk Mod Script
           ## osm0sis @ xda-developers
@@ -974,7 +983,6 @@ jobs:
           dump_boot;
 
           write_boot;
-          ${dtbolines}
           ## end boot install
           EOF
           }
@@ -1030,9 +1038,18 @@ jobs:
               # DTB utama sudah ter-append di Image.gz-dtb. dtbo dari build ini ikut di zip (diflash ke partisi dtbo).
               if [ -n "${DTBO_IMG:-}" ] && [ -f "${DTBO_IMG}" ]; then
                   cp -f "${DTBO_IMG}" "${work}/dtbo.img"
-                  log_info "dtbo.img dari build ini ikut di zip dan akan diflash ke partisi dtbo."
+                  log_info "dtbo.img dari build ini ikut di zip (diflash otomatis oleh AnyKernel write_boot)."
               else
                   log_info "dtbo tidak ikut di zip (BUILD_DTBO=0): dtbo bawaan ROM dipakai."
+              fi
+              if [ "${NEKO_REPLACE_DTB}" = "1" ]; then
+                  base_dtb="${OUT_DIR}/arch/arm64/boot/dts/mediatek/mt6785.dtb"
+                  if [ -f "${base_dtb}" ]; then
+                      cp -f "${base_dtb}" "${work}/dtb"
+                      log_info "dtb (mt6785.dtb) ikut di zip: bagian DTB di boot.img akan diganti."
+                  else
+                      log_warn "mt6785.dtb tidak ditemukan, bagian DTB boot.img tidak diganti."
+                  fi
               fi
 
               write_anykernel_sh "${work}/anykernel.sh"
@@ -1096,7 +1113,8 @@ jobs:
           NOMOUNT_REF: ${{ inputs.nomount_ref }}
           LOCALVERSION: ${{ inputs.localversion }}
           BUILD_DTBO: ${{ inputs.build_dtbo && '1' || '0' }}
-          DISABLE_LTO: ${{ inputs.disable_lto && '1' || '0' }}
+          NEKO_NO_LTO: ${{ inputs.disable_lto && '1' || '0' }}
+          NEKO_REPLACE_DTB: ${{ inputs.replace_dtb_section && '1' || '0' }}
           SWAPPINESS_PATCH: ${{ inputs.swappiness_default == 'off' && '0' || '1' }}
           SWAPPINESS_DEFAULT: ${{ inputs.swappiness_default == 'off' && '100' || inputs.swappiness_default }}
           SWAPPINESS_LOCK: ${{ inputs.swappiness_lock && '1' || '0' }}
