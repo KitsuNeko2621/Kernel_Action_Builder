@@ -1,6 +1,7 @@
-name: Build Kernel Nemo (NoMount)
+name: Build Kernel Nemo (experiment)
 
 # Workflow mandiri: tidak memerlukan file lain di repo (.github/scripts, submodule, dsb).
+# Versi ini: membuat dtbo.img dari source (3 overlay nemo) dan ikut diflash lewat zip AnyKernel.
 # Isi build.sh ditanam di step "Tulis build.sh" di bawah.
 
 on:
@@ -30,7 +31,7 @@ on:
         description: 'Aktifkan NoMount'
         required: true
         type: boolean
-        default: true
+        default: false
       nomount_ref:
         description: 'NoMount: branch / tag / commit'
         required: false
@@ -45,7 +46,7 @@ on:
         description: 'Swappiness default 0-200 (maks dinaikkan jadi 200), isi off untuk tidak mengubah swappiness'
         required: false
         type: string
-        default: '180'
+        default: 'off'
       swappiness_lock:
         description: 'Kunci swappiness (read-only, tidak bisa diubah setelah boot)'
         required: true
@@ -61,7 +62,17 @@ on:
           - 'lz4hc'
           - 'lzo-rle'
           - 'off'
-        default: 'lz4'
+        default: 'off'
+      build_dtbo:
+        description: 'Buat dtbo.img dari source (3 overlay nemo) dan ikut diflash lewat zip'
+        required: true
+        type: boolean
+        default: true
+      disable_lto:
+        description: 'Matikan LTO/CFI (build jauh lebih cepat, untuk tes)'
+        required: true
+        type: boolean
+        default: false
       clang_toolchain:
         description: 'Toolchain Clang'
         required: true
@@ -112,10 +123,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git make bc bison flex libssl-dev libelf-dev python3 zip unzip curl wget \
             cpio xz-utils zstd lz4 ccache build-essential libncurses-dev \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+            device-tree-compiler binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Pulihkan cache ccache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
           key: ccache-nemo-${{ github.run_id }}
@@ -191,6 +202,16 @@ jobs:
           #     Tanpa ini, Makefile 4.19 ikut menempelkan 3 file overlay .dtbo ke dalam Image.gz-dtb.
           DTB_ONLY="${DTB_ONLY:-1}"
 
+          # --- dtbo.img --------------------------------------------------------------------
+          # 1 = buat dtbo.img dari overlay hasil build ini dan flash bersama kernel (partisi dtbo).
+          #     Wajib kalau ROM aslinya berbasis kernel 4.14: dtbo lama TIDAK cocok dengan DTB 4.19.
+          # Format "path-relatif-dari-dts:id" sesuai configs/dtbo/dtbo.cfg di device tree nemo.
+          BUILD_DTBO="${BUILD_DTBO:-1}"
+          DTBO_ENTRIES="${DTBO_ENTRIES:-mediatek/oppo6785_20682.dtbo:0 mediatek/oppo6785_20684.dtbo:1 mediatek/oppo6785_19661.dtbo:2}"
+
+          # 1 = matikan LTO/CFI/ShadowCallStack di .config (kompilasi jauh lebih cepat, untuk tes)
+          DISABLE_LTO="${DISABLE_LTO:-0}"
+
           # --- Mode hemat RAM (cocok untuk RAM 4GB) ----------------------------------------
           # 1 = aktifkan: matikan DEBUG_INFO / SCHEDSTATS / KPROBES, perkecil log buffer kernel (128 KB),
           #     dan ganti kompresor zram default
@@ -250,7 +271,7 @@ jobs:
           # ========================
           check_deps() {
               log_info "Memeriksa dependensi sistem..."
-              local deps=(git make bc bison flex libssl-dev libelf-dev python3 zip curl wget cpio xz-utils zstd lz4 ccache build-essential libncurses-dev binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi)
+              local deps=(git make bc bison flex libssl-dev libelf-dev python3 zip curl wget cpio xz-utils zstd lz4 ccache build-essential libncurses-dev device-tree-compiler binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi)
               local missing=()
               for dep in "${deps[@]}"; do
                   dpkg -s "$dep" &>/dev/null || missing+=("$dep")
@@ -804,6 +825,7 @@ jobs:
               apply_localversion
               apply_lowram_config
               apply_nomount_config
+              apply_lto_config
               fix_compat_vdso
 
               # Header arch/uapi dibuat serial dulu supaya tidak balapan dengan kompilasi paralel
@@ -837,10 +859,82 @@ jobs:
               log_info "Waktu: $((diff / 60)) menit $((diff % 60)) detik"
           }
 
+          # Matikan LTO/CFI (opsional) supaya kompilasi jauh lebih cepat. Hanya untuk build tes.
+          apply_lto_config() {
+              [ "${DISABLE_LTO}" = "1" ] || return 0
+              local cfg="${OUT_DIR}/.config" sc="${KERNEL_DIR}/scripts/config"
+              log_info "Mematikan LTO/CFI/ShadowCallStack (build lebih cepat)"
+              bash "${sc}" --file "${cfg}" -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_PERMISSIVE -d SHADOW_CALL_STACK
+              make "${MAKE_ARGS[@]}" olddefconfig >>"${LOG_FILE}" 2>&1 || { log_error "olddefconfig gagal."; exit 1; }
+              grep -q '^CONFIG_LTO_CLANG=y' "${cfg}" && log_warn "CONFIG_LTO_CLANG tetap aktif (dipaksa oleh opsi lain)."
+              return 0
+          }
+
+          # Susun dtbo.img (format DTBO table v0, sama dengan dtbo ROM) dari overlay hasil build.
+          build_dtbo_img() {
+              DTBO_IMG=""
+              [ "${BUILD_DTBO}" = "1" ] || return 0
+              local dts_dir="${OUT_DIR}/arch/arm64/boot/dts" args=() e rel id f missing=0
+              for e in ${DTBO_ENTRIES}; do
+                  [ -f "${dts_dir}/${e%:*}" ] || missing=1
+              done
+              if [ "${missing}" = "1" ]; then
+                  log_info "Overlay .dtbo belum ada, menjalankan make dtbs..."
+                  make "${MAKE_ARGS[@]}" dtbs 2>&1 | tee -a "${LOG_FILE}"
+              fi
+              for e in ${DTBO_ENTRIES}; do
+                  rel="${e%:*}"; id="${e##*:}"; f="${dts_dir}/${rel}"
+                  [ -f "${f}" ] || {
+                      log_error "Overlay tidak ditemukan: ${f}"
+                      log_error "Cek DTBO_ENTRIES dan CONFIG_BUILD_ARM64_DTB_OVERLAY_IMAGE_NAMES di .config."
+                      exit 1
+                  }
+                  args+=("${f}:${id}")
+              done
+              python3 - "${KERNEL_DIR}/dtbo_new.img" "${args[@]}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+          import struct, sys
+          out, ents = sys.argv[1], sys.argv[2:]
+          blobs = []
+          for e in ents:
+              p, _, i = e.rpartition(":")
+              blobs.append((open(p, "rb").read(), int(i, 0)))
+          HDR = ESZ = 32
+          n = len(blobs)
+          off = HDR + ESZ * n
+          table, data = b"", b""
+          for b, i in blobs:
+              table += struct.pack(">8I", len(b), off + len(data), i, 0, 0, 0, 0, 0)
+              data += b
+          img = struct.pack(">8I", 0xD7B7AB1E, off + len(data), HDR, ESZ, n, HDR, 2048, 0) + table + data
+          open(out, "wb").write(img)
+          print("[DTBO] %s: %d entry, %d byte" % (out, n, len(img)))
+          PY
+              [ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "Gagal menyusun dtbo.img."; exit 1; }
+              DTBO_IMG="${KERNEL_DIR}/dtbo_new.img"
+              log_success "dtbo.img: ${DTBO_IMG}"
+          }
+
+          # DTS hasil decompile + .config, untuk dibandingkan dengan dtbo ROM (diunggah sebagai artifact)
+          dump_dts_debug() {
+              local dbg="${KERNEL_DIR}/debug" dts_dir="${OUT_DIR}/arch/arm64/boot/dts" f
+              mkdir -p "${dbg}"
+              cp -f "${OUT_DIR}/.config" "${dbg}/config.txt" 2>/dev/null
+              command -v dtc >/dev/null 2>&1 || { log_warn "dtc tidak ada, DTS tidak di-dump."; return 0; }
+              for f in "${dts_dir}/mediatek/mt6785.dtb" "${dts_dir}"/mediatek/oppo6785_*.dtbo; do
+                  [ -f "${f}" ] || continue
+                  dtc -I dtb -O dts -o "${dbg}/$(basename "${f}").dts" "${f}" 2>/dev/null
+              done
+              if [ -f "${dbg}/mt6785.dtb.dts" ] && ! grep -q '__symbols__' "${dbg}/mt6785.dtb.dts"; then
+                  log_warn "Base DTB tidak punya __symbols__: overlay bisa gagal menempel."
+              fi
+              return 0
+          }
+
           # Menulis anykernel.sh khusus RM6785 (boot only, tanpa contoh ramdisk "tuna" bawaan upstream)
           write_anykernel_sh() {
-              local f="$1" i=0 d devlines=""
+              local f="$1" i=0 d devlines="" dtbolines=""
               for d in ${AK_DEVICES}; do i=$((i + 1)); devlines+="device.name${i}=${d}"$'\n'; done
+              [ -n "${DTBO_IMG:-}" ] && dtbolines="flash_generic dtbo;"
               cat > "${f}" <<EOF
           ### AnyKernel3 Ramdisk Mod Script
           ## osm0sis @ xda-developers
@@ -880,6 +974,7 @@ jobs:
           dump_boot;
 
           write_boot;
+          ${dtbolines}
           ## end boot install
           EOF
           }
@@ -932,7 +1027,13 @@ jobs:
               cp -a "${ANYKERNEL_DIR}/." "${work}/"
               rm -rf "${work}/.git"
               cp -f "${KERNEL_IMG}" "${work}/"
-              # DTB sudah ter-append di Image.gz-dtb; dtbo memakai bawaan ROM (tidak diflash dari sini).
+              # DTB utama sudah ter-append di Image.gz-dtb. dtbo dari build ini ikut di zip (diflash ke partisi dtbo).
+              if [ -n "${DTBO_IMG:-}" ] && [ -f "${DTBO_IMG}" ]; then
+                  cp -f "${DTBO_IMG}" "${work}/dtbo.img"
+                  log_info "dtbo.img dari build ini ikut di zip dan akan diflash ke partisi dtbo."
+              else
+                  log_info "dtbo tidak ikut di zip (BUILD_DTBO=0): dtbo bawaan ROM dipakai."
+              fi
 
               write_anykernel_sh "${work}/anykernel.sh"
               patch_banner "${work}/META-INF/com/google/android/update-binary" || \
@@ -976,6 +1077,8 @@ jobs:
                   mkdir -p "${OUT_DIR}"
                   setup_env
                   build_kernel
+                  build_dtbo_img
+                  dump_dts_debug
                   package_zip
                   ;;
           esac
@@ -992,6 +1095,8 @@ jobs:
           NOMOUNT: ${{ inputs.enable_nomount && '1' || '0' }}
           NOMOUNT_REF: ${{ inputs.nomount_ref }}
           LOCALVERSION: ${{ inputs.localversion }}
+          BUILD_DTBO: ${{ inputs.build_dtbo && '1' || '0' }}
+          DISABLE_LTO: ${{ inputs.disable_lto && '1' || '0' }}
           SWAPPINESS_PATCH: ${{ inputs.swappiness_default == 'off' && '0' || '1' }}
           SWAPPINESS_DEFAULT: ${{ inputs.swappiness_default == 'off' && '100' || inputs.swappiness_default }}
           SWAPPINESS_LOCK: ${{ inputs.swappiness_lock && '1' || '0' }}
@@ -1005,6 +1110,17 @@ jobs:
           cd "$HOME/work"
           if [ -n "$KERNEL_REPO_TOKEN" ]; then echo "::add-mask::$KERNEL_REPO_TOKEN"; fi
           bash build.sh 2>&1 | tee "$HOME/work/ci-build.log"
+
+      - name: Statistik ccache
+        if: always()
+        run: ccache -s || true
+
+      - name: Simpan cache ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-nemo-${{ github.run_id }}
 
       - name: Cari ZIP hasil build
         env:
@@ -1047,6 +1163,17 @@ jobs:
           path: ${{ env.ZIP_PATH }}
           retention-days: 14
           if-no-files-found: error
+
+      - name: Upload dtbo dan DTS debug
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo-debug-${{ github.run_number }}
+          path: |
+            ~/work/android_kernel_realme_nemo/dtbo_new.img
+            ~/work/android_kernel_realme_nemo/debug/
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Upload log build
         if: always()
