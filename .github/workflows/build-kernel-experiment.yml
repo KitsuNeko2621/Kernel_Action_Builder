@@ -1,4 +1,4 @@
-name: Build Kernel Nemo (Experiment)
+name: Build Kernel Nemo (expe)
 
 # Workflow mandiri: tidak memerlukan file lain di repo (.github/scripts, submodule, dsb).
 # Isi build.sh ditanam di step "Tulis build.sh" di bawah.
@@ -862,7 +862,7 @@ jobs:
           }
 
           # Frekuensi tertinggi GPU/CPU lewat tabel OPP driver MediaTek (mt6785). Lokasi file dicari dari
-          # nama simbol, bukan path tetap. Gagal/ambigu -> build dihentikan (agar tidak salah mengira OC aktif).
+          # nama simbol; semua salinan mt6785 di repo ditambal. Tidak ada yang berhasil -> build dihentikan.
           patch_opp() {
               [ "${GPU_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_MAX_KHZ}" = "0" ] && return 0
               local v
@@ -871,7 +871,7 @@ jobs:
               done
               log_info "Patch OPP: GPU max=${GPU_MAX_KHZ} kHz, CPU A76 max=${CPU_BIG_MAX_KHZ} kHz (0 = tidak diubah)"
               python3 - "${KERNEL_DIR}" "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
-          import re, subprocess, sys
+          import os, re, subprocess, sys
           root, gpu_khz, cpu_khz = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
           failed = False
 
@@ -880,69 +880,81 @@ jobs:
               failed = True
               print(f"[ERROR] {msg}")
 
+          def warn(msg):
+              print(f"[WARN] {msg}")
+
+          def rel(p):
+              return p.replace(root + "/", "")
+
           def find(pattern, glob):
               r = subprocess.run(["grep", "-rlE", "--include=" + glob, pattern, root + "/drivers"],
                                  capture_output=True, text=True)
               return sorted(r.stdout.split())
 
-          def only(files, what):
-              if len(files) != 1:
-                  err(f"{what}: ditemukan {len(files)} file ({', '.join(files) or '-'}), harus tepat 1")
-                  return None
-              return files[0]
+          # Repo bisa punya beberapa salinan driver (mis. drivers/gpu/... dan drivers/misc/...).
+          # Semua salinan mt6785 ditambal; mana yang dikompilasi tidak perlu ditebak.
 
-          # ---- GPU: naikkan OPP tertinggi segmen MT6785T (G90T), hanya ke OPP yang SUDAH ada di tabel ----
+          # ---- GPU: OPP tertinggi segmen MT6785T (G90T), hanya ke OPP yang SUDAH ada di tabel ----
           if gpu_khz:
-              h = only(find(r"SEG_GPU_DVFS_FREQ0\b", "*.h"), "tabel OPP GPU (SEG_GPU_DVFS_FREQ0)")
-              c = None
-              if h:
-                  c = only([f for f in find(r"g_segment_max_opp_idx = [0-9]+;", "*.c")
-                            if "MT6785T_SEGMENT" in open(f).read()], "driver gpufreq (MT6785T_SEGMENT)")
-              if h and c:
+              srcs = [f for f in find(r"g_segment_max_opp_idx = [0-9]+;", "*.c") if "MT6785T_SEGMENT" in open(f).read()]
+              if not srcs:
+                  err("driver gpufreq dengan MT6785T_SEGMENT tidak ditemukan")
+              done = 0
+              for c in srcs:
+                  h = os.path.join(os.path.dirname(c), "mtk_gpufreq_core.h")
+                  if not os.path.isfile(h):
+                      warn(f"{rel(c)}: mtk_gpufreq_core.h tidak ada di folder yang sama, dilewati")
+                      continue
                   idx_of = {int(m.group(2)): int(m.group(1)) for m in
                             re.finditer(r"#define\s+SEG_GPU_DVFS_FREQ(\d+)\s*\((\d+)\)", open(h).read())}
+                  ok = ", ".join(str(k) for k, v in sorted(idx_of.items()) if 13 <= v <= 15)
                   if gpu_khz not in idx_of:
-                      err(f"GPU {gpu_khz} kHz bukan OPP yang ada di tabel (OPP 13-15: "
-                          f"{', '.join(str(k) for k, v in sorted(idx_of.items()) if 13 <= v <= 15)})")
-                  elif not 13 <= idx_of[gpu_khz] <= 15:
-                      err(f"GPU {gpu_khz} kHz = OPP {idx_of[gpu_khz]}; hanya OPP 13-15 yang diizinkan "
-                          f"(di atas itu tidak divalidasi untuk segmen G90T)")
-                  else:
-                      idx = idx_of[gpu_khz]
-                      src = open(c).read()
-                      pat = re.compile(r"(else if \(g_segment_id == MT6785T_SEGMENT\)\s*\n\s*g_segment_max_opp_idx = )(\d+)(;)")
-                      if not pat.search(src):
-                          err("pola g_segment_max_opp_idx untuk MT6785T tidak ditemukan")
-                      else:
-                          open(c, "w").write(pat.sub(lambda m: m.group(1) + str(idx) + m.group(3), src, count=1))
-                          print(f"[PATCH] {c.replace(root + '/', '')}: GPU G90T OPP tertinggi = OPP {idx} ({gpu_khz} kHz)")
+                      err(f"{rel(h)}: GPU {gpu_khz} kHz bukan OPP di tabel (OPP 13-15: {ok})")
+                      continue
+                  idx = idx_of[gpu_khz]
+                  if not 13 <= idx <= 15:
+                      err(f"GPU {gpu_khz} kHz = OPP {idx}; hanya OPP 13-15 yang diizinkan (OPP lebih tinggi tidak divalidasi untuk G90T)")
+                      continue
+                  src = open(c).read()
+                  pat = re.compile(r"(else if \(g_segment_id == MT6785T_SEGMENT\)\s*\n\s*g_segment_max_opp_idx = )(\d+)(;)")
+                  if not pat.search(src):
+                      warn(f"{rel(c)}: pola g_segment_max_opp_idx MT6785T tidak cocok, dilewati")
+                      continue
+                  open(c, "w").write(pat.sub(lambda m: m.group(1) + str(idx) + m.group(3), src, count=1))
+                  print(f"[PATCH] {rel(c)}: G90T OPP tertinggi = OPP {idx} ({gpu_khz} kHz)")
+                  done += 1
+              if done == 0 and not failed:
+                  err("tidak ada salinan driver GPU yang berhasil ditambal")
 
           # ---- CPU: A76 (cluster "L") segmen 6785T, OPP0. Frekuensi saja; voltase TIDAK diubah ----
           if cpu_khz:
               if cpu_khz % 1000 or not 2050000 <= cpu_khz <= 2100000:
                   err(f"CPU_BIG_MAX_KHZ={cpu_khz}: harus kelipatan 1000 dan di antara 2050000-2100000")
               else:
-                  o = only(find(r"CPU_DVFS_FREQ0_L_6785T\b", "*.h"), "tabel OPP CPU (CPU_DVFS_FREQ0_L_6785T)")
-                  p = only(find(r"FY_6785TTbl\b", "*.h"), "tabel PV CPU (FY_6785TTbl)")
-                  if o and p:
+                  mhz = cpu_khz // 1000
+                  n_opp = n_pv = 0
+                  for o in find(r"CPU_DVFS_FREQ0_L_6785T\b", "*.h"):
                       s = open(o).read()
                       m = re.search(r"(#define\s+CPU_DVFS_FREQ0_L_6785T\s+)(\d+)", s)
                       if not m or int(m.group(2)) not in (2050000, cpu_khz):
-                          err(f"CPU_DVFS_FREQ0_L_6785T bernilai tak terduga ({m.group(2) if m else '?'})")
-                      else:
-                          s = s[:m.start(2)] + str(cpu_khz) + s[m.end(2):]
-                          t = open(p).read()
-                          blk = re.search(r"static unsigned int FY_6785TTbl\[.*?\n\};", t, re.S)
-                          row = re.search(r"(/\* L \*/\s*\n\s*\{\s*)(\d+)(,\s*115,\s*1,\s*1\s*\})", blk.group(0)) if blk else None
-                          mhz = cpu_khz // 1000
-                          if not row or int(row.group(2)) not in (2050, mhz):
-                              err("baris OPP0 cluster L di FY_6785TTbl tidak cocok (2050, 115, 1, 1)")
-                          else:
-                              new_blk = blk.group(0)[:row.start(2)] + str(mhz) + blk.group(0)[row.end(2):]
-                              t = t[:blk.start()] + new_blk + t[blk.end():]
-                              open(o, "w").write(s)
-                              open(p, "w").write(t)
-                              print(f"[PATCH] CPU A76 (6785T) OPP0 = {cpu_khz} kHz di tabel OPP dan PV; voltase tetap 1.11875 V")
+                          warn(f"{rel(o)}: CPU_DVFS_FREQ0_L_6785T bernilai tak terduga, dilewati")
+                          continue
+                      open(o, "w").write(s[:m.start(2)] + str(cpu_khz) + s[m.end(2):])
+                      print(f"[PATCH] {rel(o)}: CPU_DVFS_FREQ0_L_6785T = {cpu_khz} kHz")
+                      n_opp += 1
+                  for p in find(r"FY_6785TTbl\b", "*.h"):
+                      t = open(p).read()
+                      blk = re.search(r"static unsigned int FY_6785TTbl\[.*?\n\};", t, re.S)
+                      row = re.search(r"(/\* L \*/\s*\n\s*\{\s*)(\d+)(,\s*115,\s*1,\s*1\s*\})", blk.group(0)) if blk else None
+                      if not row or int(row.group(2)) not in (2050, mhz):
+                          warn(f"{rel(p)}: baris OPP0 cluster L di FY_6785TTbl tidak cocok, dilewati")
+                          continue
+                      nb = blk.group(0)[:row.start(2)] + str(mhz) + blk.group(0)[row.end(2):]
+                      open(p, "w").write(t[:blk.start()] + nb + t[blk.end():])
+                      print(f"[PATCH] {rel(p)}: OPP0 cluster L (6785T) = {mhz} MHz; voltase tetap 1.11875 V")
+                      n_pv += 1
+                  if n_opp == 0 or n_pv == 0:
+                      err(f"tabel CPU belum lengkap ditambal (tabel OPP: {n_opp}, tabel PV: {n_pv}); keduanya harus >= 1")
 
           sys.exit(1 if failed else 0)
           PY
