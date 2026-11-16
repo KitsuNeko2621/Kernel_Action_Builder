@@ -57,10 +57,10 @@ on:
         type: string
         default: '150'
       swappiness_lock:
-        description: 'Kunci swappiness (read-only, tidak bisa diubah setelah boot). Disarankan OFF: ROM/tweak masih bisa menyesuaikan'
+        description: 'Kunci swappiness (/proc/sys/vm/swappiness jadi 0444 read-only, tidak bisa diubah setelah boot, ROM/tweak tidak bisa menimpa)'
         required: true
         type: boolean
-        default: false
+        default: true
       lowram_mode:
         description: 'Mode hemat RAM + kompresor zram default (off = matikan mode hemat RAM)'
         required: true
@@ -233,7 +233,7 @@ jobs:
           SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-150}"
           # 1 = kunci: /proc/sys/vm/swappiness jadi 0444 (read-only, root pun tidak bisa menulis) dan
           #     tulis ke memory.swappiness cgroup ROOT diabaikan (tetap dianggap sukses, tidak mengubah nilai)
-          SWAPPINESS_LOCK="${SWAPPINESS_LOCK:-0}"
+          SWAPPINESS_LOCK="${SWAPPINESS_LOCK:-1}"
           AK_KERNEL_STRING="${AK_KERNEL_STRING:-Neko Kernel}"
           AK_AUTHOR="${AK_AUTHOR:-KitsuNeko}"      # tampil sebagai "By <AK_AUTHOR>" (disarankan 12 karakter agar bingkai lurus)
           # Kode model yang boleh flash (do.devicecheck=1). Spasi sebagai pemisah.
