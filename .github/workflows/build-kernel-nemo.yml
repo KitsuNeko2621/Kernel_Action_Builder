@@ -31,6 +31,16 @@ on:
         required: true
         type: boolean
         default: true
+      stable_mode:
+        description: 'Mode stabil: matikan NoMount, mode hemat RAM, dan patch swappiness (untuk pembanding saat bootloop)'
+        required: true
+        type: boolean
+        default: false
+      vm_tune:
+        description: 'Tuning RAM untuk zram + gaming (page-cluster 0, watermark_scale_factor 30)'
+        required: true
+        type: boolean
+        default: true
       nomount_ref:
         description: 'NoMount: branch / tag / commit'
         required: false
@@ -45,12 +55,12 @@ on:
         description: 'Swappiness default 0-200 (maks dinaikkan jadi 200), isi off untuk tidak mengubah swappiness'
         required: false
         type: string
-        default: '180'
+        default: '100'
       swappiness_lock:
-        description: 'Kunci swappiness (read-only, tidak bisa diubah setelah boot)'
+        description: 'Kunci swappiness (read-only, tidak bisa diubah setelah boot). Disarankan OFF: ROM/tweak masih bisa menyesuaikan'
         required: true
         type: boolean
-        default: true
+        default: false
       lowram_mode:
         description: 'Mode hemat RAM + kompresor zram default (off = matikan mode hemat RAM)'
         required: true
@@ -62,6 +72,16 @@ on:
           - 'lzo-rle'
           - 'off'
         default: 'lz4'
+      zram_size_percent:
+        description: 'Ukuran zram MINIMUM (% dari RAM). 0 = tidak diubah (ROM-mu sekarang 75%). 100 = sebesar RAM, 150 = 1,5x RAM, 200 = 2x RAM (maks 200)'
+        required: true
+        type: string
+        default: '150'
+      aggressive_debug_off:
+        description: 'Mode hemat RAM juga mematikan SCHEDSTATS & KPROBES (sedikit lebih ringan, tapi lebih berisiko bootloop). Default OFF'
+        required: true
+        type: boolean
+        default: false
       clang_toolchain:
         description: 'Toolchain Clang'
         required: true
@@ -71,7 +91,7 @@ on:
           - 'neutron'
         default: 'greenforce'
       clang_version:
-        description: 'Greenforce Clang: latest | angka major (mis. 19) | tag rilis'
+        description: 'Greenforce Clang: latest | angka major (mis. 19) | tag rilis. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
         required: false
         type: string
         default: 'latest'
@@ -186,27 +206,59 @@ jobs:
           # Branch / tag / commit. Tulis commit atau tag supaya build bisa diulang persis sama.
           NOMOUNT_REF="${NOMOUNT_REF:-dev}"
 
+          # --- Image.gz-dtb ---------------------------------------------------------------
+          # 1 = hanya DTB utama yang ditempel ke Image.gz-dtb (seperti kernel 4.14 yang berfungsi).
+          #     Tanpa ini, Makefile 4.19 ikut menempelkan 3 file overlay .dtbo ke dalam Image.gz-dtb.
+          DTB_ONLY="${DTB_ONLY:-1}"
+
           # --- Mode hemat RAM (cocok untuk RAM 4GB) ----------------------------------------
           # 1 = aktifkan: matikan DEBUG_INFO / SCHEDSTATS / KPROBES, perkecil log buffer kernel (128 KB),
           #     dan ganti kompresor zram default
           LOWRAM="${LOWRAM:-1}"
+          # 1 = mode hemat RAM juga mematikan SCHEDSTATS & KPROBES. Default 0 (konservatif): hanya DEBUG_INFO yang dimatikan.
+          LOWRAM_AGGRESSIVE="${LOWRAM_AGGRESSIVE:-0}"
           # Kompresor zram default: lz4 (cepat, UI mulus) | zstd (rasio lebih baik, CPU lebih berat) |
           #                         lz4hc | lzo | lzo-rle (bawaan kernel). ROM yang menulis
           #                         /sys/block/zram0/comp_algorithm tetap menimpa nilai ini.
           ZRAM_COMP="${ZRAM_COMP:-lz4}"
+          # Ukuran zram MINIMUM, % dari RAM total (0 = tidak diubah). Ukuran zram sebenarnya ditulis userspace
+          # (fstab: zramsize=75%) ke /sys/block/zram0/disksize; patch ini menaikkannya ke minimal nilai ini,
+          # berapa pun yang diminta ROM. Nilai lebih kecil dari ini tidak bisa diset setelah boot.
+          ZRAM_MIN_PERCENT="${ZRAM_MIN_PERCENT:-0}"
 
           # --- Swappiness ---------------------------------------------------------------
           # 1 = patch source: batas swappiness 100 -> 200 (sysctl & memcg), default diatur di bawah
           SWAPPINESS_PATCH="${SWAPPINESS_PATCH:-1}"
           # Nilai default saat boot (0-200). Kalau SWAPPINESS_LOCK=1, ini jadi nilai TETAP.
-          SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-180}"
+          SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-100}"
           # 1 = kunci: /proc/sys/vm/swappiness jadi 0444 (read-only, root pun tidak bisa menulis) dan
           #     tulis ke memory.swappiness cgroup ROOT diabaikan (tetap dianggap sukses, tidak mengubah nilai)
-          SWAPPINESS_LOCK="${SWAPPINESS_LOCK:-1}"
+          SWAPPINESS_LOCK="${SWAPPINESS_LOCK:-0}"
           AK_KERNEL_STRING="${AK_KERNEL_STRING:-Neko Kernel}"
           AK_AUTHOR="${AK_AUTHOR:-KitsuNeko}"      # tampil sebagai "By <AK_AUTHOR>" (disarankan 12 karakter agar bingkai lurus)
           # Kode model yang boleh flash (do.devicecheck=1). Spasi sebagai pemisah.
           AK_DEVICES="${AK_DEVICES:-RMX2151 rmx2151 RMX2161 rmx2161 RMX2001 rmx2001 RMX2002 rmx2002 RMX2002L1 rmx2002L1 RMX2001L1 rmx2001L1 RMX2003 RMX2153 RMX2153L1 RMX2156 RMX2163 RMX2161L1 RMX2163L1 RMX3031 IN2023 GM1917 RM6785 rm6785 wasabi}"
+
+          # --- Tuning manajemen RAM (zram + gaming) -----------------------------------------
+          # 1 = aktifkan patch default VM di bawah (nilainya tetap bisa diubah lewat /proc/sys/vm/ saat runtime)
+          VM_TUNE="${VM_TUNE:-1}"
+          # page-cluster 0: swap-in dari zram membaca 1 halaman, bukan 8 (bawaan kernel 3). Standar untuk zram.
+          VM_PAGE_CLUSTER="${VM_PAGE_CLUSTER:-0}"
+          # watermark_scale_factor: jarak watermark kswapd (bawaan 10 = 0,1% RAM). Lebih besar = kswapd bangun
+          # lebih awal sehingga direct reclaim (penyebab stutter) berkurang, dengan biaya sedikit RAM bebas.
+          VM_WATERMARK_SCALE="${VM_WATERMARK_SCALE:-30}"
+
+          # --- Mode stabil -------------------------------------------------------------------
+          # 1 = build konservatif: matikan semua tambahan (NoMount, mode hemat RAM, patch swappiness).
+          #     Berguna sebagai pembanding saat mencari penyebab bootloop. Patch DTB tetap berlaku.
+          STABLE="${STABLE:-0}"
+          if [ "${STABLE}" = "1" ]; then
+              NOMOUNT=0
+              LOWRAM=0
+              SWAPPINESS_PATCH=0
+              VM_TUNE=0
+              ZRAM_MIN_PERCENT=0
+          fi
 
           if [ -f "${PWD}/Makefile" ] && [ -d "${PWD}/arch/arm64" ]; then
               KERNEL_DIR="${PWD}"
@@ -559,6 +611,53 @@ jobs:
               mkdir -p "${OUT_DIR}"
           }
 
+          # Makefile boot kernel 4.19 ini menempelkan overlay (.dtbo) ke Image.gz-dtb; kernel 4.14 hanya DTB utama.
+          # Pindahkan definisi DTB_OBJS ke sebelum daftar overlay ditambahkan (idempoten).
+          patch_dtb_append() {
+              [ "${DTB_ONLY}" = "1" ] || return 0
+              python3 - "${KERNEL_DIR}/arch/arm64/boot/Makefile" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          obj = "DTB_OBJS := $(addprefix $(obj)/dts/,$(DTB_LIST))\n"
+          i_obj = s.find(obj)
+          i_dtbo = s.find("DTBO_NAMES :=")
+          if i_obj < 0 or i_dtbo < 0:
+              print("[PATCH] arch/arm64/boot/Makefile: pola tidak dikenali, dilewati")
+              sys.exit(0)
+          if i_obj < i_dtbo:
+              print("[PATCH] arch/arm64/boot/Makefile: sudah hanya DTB utama, tidak ada perubahan")
+              sys.exit(0)
+          s = s.replace(obj, "", 1)
+          s = s.replace("DTBO_NAMES :=", obj + "\nDTBO_NAMES :=", 1)
+          open(p, "w").write(s)
+          print("[PATCH] arch/arm64/boot/Makefile: Image.gz-dtb hanya berisi DTB utama (overlay tidak ditempel)")
+          PY
+          }
+
+          # Default VM untuk zram + gaming (idempoten). Nilai tetap bisa diubah saat runtime lewat sysctl.
+          patch_vm_tuning() {
+              [ "${VM_TUNE}" = "1" ] || return 0
+              local v
+              for v in "${VM_PAGE_CLUSTER}:0:6:VM_PAGE_CLUSTER" "${VM_WATERMARK_SCALE}:1:1000:VM_WATERMARK_SCALE"; do
+                  local val="${v%%:*}" rest="${v#*:}"
+                  local lo="${rest%%:*}"; rest="${rest#*:}"
+                  local hi="${rest%%:*}" name="${rest#*:}"
+                  if ! [[ "${val}" =~ ^[0-9]+$ ]] || [ "${val}" -lt "${lo}" ] || [ "${val}" -gt "${hi}" ]; then
+                      log_error "${name} harus angka ${lo}-${hi} (sekarang: '${val}')"
+                      exit 1
+                  fi
+              done
+              local swp="${KERNEL_DIR}/mm/swap.c" pga="${KERNEL_DIR}/mm/page_alloc.c"
+              if grep -qE '^[[:space:]]+page_cluster = [0-9]+;' "${swp}" && grep -qE '^int watermark_scale_factor = [0-9]+;' "${pga}"; then
+                  sed -i -E "s/^([[:space:]]+page_cluster = )[0-9]+;/\1${VM_PAGE_CLUSTER};/" "${swp}"
+                  sed -i -E "s/^(int watermark_scale_factor = )[0-9]+;/\1${VM_WATERMARK_SCALE};/" "${pga}"
+                  log_info "VM tuning: page-cluster=${VM_PAGE_CLUSTER}, watermark_scale_factor=${VM_WATERMARK_SCALE}"
+              else
+                  log_warn "Pola kode VM (swap.c / page_alloc.c) tidak dikenali, VM tuning dilewati."
+              fi
+          }
+
           # Patch swappiness langsung di source (idempoten: aman dijalankan berulang kali)
           patch_swappiness() {
               [ "${SWAPPINESS_PATCH}" = "1" ] || return 0
@@ -682,7 +781,8 @@ jobs:
               fi
           }
 
-          # Ganti kompresor zram default di source (di kernel 4.19 tidak ada opsi Kconfig-nya)
+          # Kompresor zram default. Kernel 4.19 menulisnya langsung di kode (default_compressor = "lzo-rle"),
+          # kernel 4.14 memakai opsi Kconfig ZRAM_DEF_COMP_* (diatur di apply_lowram_config).
           patch_zram_compressor() {
               [ "${LOWRAM}" = "1" ] || return 0
               case "${ZRAM_COMP}" in
@@ -690,31 +790,108 @@ jobs:
                   *) log_error "ZRAM_COMP tidak valid: '${ZRAM_COMP}' (pilih: lzo lzo-rle lz4 lz4hc zstd)"; exit 1 ;;
               esac
               local f="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
-              if ! grep -qE 'static const char \*default_compressor = "[^"]*";' "${f}"; then
-                  log_error "default_compressor tidak ditemukan di zram_drv.c (source berbeda?)"
+              local k="${KERNEL_DIR}/drivers/block/zram/Kconfig"
+              if grep -qE 'static const char \*default_compressor = "[^"]*";' "${f}"; then
+                  sed -i -E "s|(static const char \*default_compressor = )\"[^\"]*\";|\1\"${ZRAM_COMP}\";|" "${f}"
+                  ZRAM_COMP_MODE="source"
+                  log_info "Kompresor zram default (source): ${ZRAM_COMP}"
+              elif grep -q 'config ZRAM_DEF_COMP_LZ4' "${k}" 2>/dev/null; then
+                  ZRAM_COMP_MODE="kconfig"
+                  log_info "Kompresor zram default (Kconfig): ${ZRAM_COMP}"
+              else
+                  ZRAM_COMP_MODE="none"
+                  log_warn "Pola default_compressor tidak dikenali, kompresor zram tidak diubah."
+              fi
+          }
+
+          # Ukuran zram minimum (idempoten). Gagal mengenali pola kode -> hanya peringatan, build lanjut.
+          patch_zram_size() {
+              [ "${ZRAM_MIN_PERCENT}" = "0" ] && return 0
+              if ! [[ "${ZRAM_MIN_PERCENT}" =~ ^[0-9]+$ ]] || [ "${ZRAM_MIN_PERCENT}" -gt 200 ]; then
+                  log_error "ZRAM_MIN_PERCENT harus angka 0-200 (sekarang: '${ZRAM_MIN_PERCENT}')"
                   exit 1
               fi
-              sed -i -E "s|(static const char \*default_compressor = )\"[^\"]*\";|\1\"${ZRAM_COMP}\";|" "${f}"
-              log_info "Kompresor zram default: ${ZRAM_COMP}"
+              local f="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
+              [ -f "${f}" ] || { log_warn "zram_drv.c tidak ditemukan, ukuran zram tidak diubah."; return 0; }
+              python3 - "${f}" "${ZRAM_MIN_PERCENT}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+          import re, sys
+          p, pct = sys.argv[1], sys.argv[2]
+          s = open(p).read()
+          define = f"#define NEKO_ZRAM_MIN_PCT {pct}\n"
+          if "NEKO_ZRAM_MIN_PCT" in s:
+              open(p, "w").write(re.sub(r"#define NEKO_ZRAM_MIN_PCT \d+\n", define, s, count=1))
+              print(f"[PATCH] zram_drv.c: ukuran minimum zram diperbarui -> {pct}% RAM (sudah dipatch sebelumnya)")
+              sys.exit(0)
+          inc = '#include "zram_drv.h"\n'
+          m = re.search(r"(\tdisksize = memparse\(buf, NULL\);\n\tif \(!disksize\)\n\t\treturn -EINVAL;\n)", s)
+          if inc not in s or not m:
+              print("[WARN] zram_drv.c: pola disksize_store tidak dikenali, ukuran zram tidak diubah")
+              sys.exit(3)
+          block = (
+              "\n\t/* NEKO: ukuran zram minimum = NEKO_ZRAM_MIN_PCT% dari RAM (ROM boleh minta lebih besar) */\n"
+              "\t{\n"
+              "\t\tstruct sysinfo neko_si;\n"
+              "\t\tu64 neko_min;\n\n"
+              "\t\tsi_meminfo(&neko_si);\n"
+              "\t\tneko_min = (u64)neko_si.totalram * neko_si.mem_unit / 100 * NEKO_ZRAM_MIN_PCT;\n"
+              "\t\tif (disksize < neko_min)\n"
+              "\t\t\tdisksize = neko_min;\n"
+              "\t}\n"
+          )
+          s = s.replace(inc, inc + define, 1)
+          s = s.replace(m.group(1), m.group(1) + block, 1)
+          open(p, "w").write(s)
+          print(f"[PATCH] zram_drv.c: ukuran minimum zram = {pct}% dari RAM")
+          PY
+              [ "${PIPESTATUS[0]}" -eq 0 ] || log_warn "Patch ukuran zram dilewati (lihat pesan di atas)."
           }
 
           # Opsi config hemat RAM, diterapkan ke out/.config (tidak mengubah file defconfig di source)
           apply_lowram_config() {
               [ "${LOWRAM}" = "1" ] || return 0
               local cfg="${OUT_DIR}/.config" sc="${KERNEL_DIR}/scripts/config"
-              log_info "Mode hemat RAM: LOG_BUF_SHIFT=17, DEBUG_INFO/SCHEDSTATS/KPROBES dimatikan"
-              bash "${sc}" --file "${cfg}" \
-                  --set-val LOG_BUF_SHIFT 17 \
-                  -d DEBUG_INFO -d SCHEDSTATS -d KPROBES
-              # lz4hc butuh algoritmanya tersedia di crypto
-              [ "${ZRAM_COMP}" = "lz4hc" ] && bash "${sc}" --file "${cfg}" -e CRYPTO_LZ4HC
+              local cur_shift; cur_shift=$(sed -n 's/^CONFIG_LOG_BUF_SHIFT=//p' "${cfg}")
+              if [ "${LOWRAM_AGGRESSIVE}" = "1" ]; then
+                  log_info "Mode hemat RAM (agresif): DEBUG_INFO/SCHEDSTATS/KPROBES dimatikan, log buffer maks 128 KB"
+              else
+                  log_info "Mode hemat RAM: hanya DEBUG_INFO dimatikan (SCHEDSTATS/KPROBES dibiarkan), log buffer maks 128 KB"
+              fi
+              if [ "${LOWRAM_AGGRESSIVE}" = "1" ]; then
+                  bash "${sc}" --file "${cfg}" -d DEBUG_INFO -d SCHEDSTATS -d KPROBES
+              else
+                  bash "${sc}" --file "${cfg}" -d DEBUG_INFO
+              fi
+              # log buffer hanya diperkecil, tidak pernah diperbesar
+              if [ -z "${cur_shift}" ] || [ "${cur_shift}" -gt 17 ]; then
+                  bash "${sc}" --file "${cfg}" --set-val LOG_BUF_SHIFT 17
+              fi
+              # Kompresor zram lewat Kconfig (kernel 4.14) + pastikan algoritma crypto-nya ikut ada
+              if [ "${ZRAM_COMP_MODE:-}" = "kconfig" ]; then
+                  local sym
+                  case "${ZRAM_COMP}" in
+                      lzo-rle) sym=ZRAM_DEF_COMP_LZORLE ;;
+                      lzo)     sym=ZRAM_DEF_COMP_LZO ;;
+                      lz4)     sym=ZRAM_DEF_COMP_LZ4 ;;
+                      lz4hc)   sym=ZRAM_DEF_COMP_LZ4HC ;;
+                      zstd)    sym=ZRAM_DEF_COMP_ZSTD ;;
+                  esac
+                  bash "${sc}" --file "${cfg}" -e "${sym}"
+              fi
+              case "${ZRAM_COMP}" in
+                  lz4)   bash "${sc}" --file "${cfg}" -e CRYPTO_LZ4 ;;
+                  lz4hc) bash "${sc}" --file "${cfg}" -e CRYPTO_LZ4HC ;;
+                  zstd)  bash "${sc}" --file "${cfg}" -e CRYPTO_ZSTD ;;
+              esac
               make "${MAKE_ARGS[@]}" olddefconfig >>"${LOG_FILE}" 2>&1 || { log_error "olddefconfig gagal."; exit 1; }
               # Periksa hasilnya (sebagian opsi bisa dipaksa aktif oleh Kconfig lain)
               local opt
-              for opt in DEBUG_INFO SCHEDSTATS KPROBES; do
+              local opts="DEBUG_INFO"; [ "${LOWRAM_AGGRESSIVE}" = "1" ] && opts="DEBUG_INFO SCHEDSTATS KPROBES"
+              for opt in ${opts}; do
                   grep -q "^CONFIG_${opt}=y" "${cfg}" && log_warn "CONFIG_${opt} tetap aktif (dipaksa oleh opsi lain)."
               done
-              grep -q '^CONFIG_LOG_BUF_SHIFT=17' "${cfg}" || log_warn "LOG_BUF_SHIFT tidak menjadi 17."
+              if [ "${ZRAM_COMP_MODE:-}" = "kconfig" ] && ! grep -q "^CONFIG_ZRAM_DEF_COMP=\"${ZRAM_COMP}\"" "${cfg}"; then
+                  log_warn "Kompresor zram di .config bukan '${ZRAM_COMP}': $(grep '^CONFIG_ZRAM_DEF_COMP=' "${cfg}")"
+              fi
           }
 
           apply_localversion() {
@@ -913,7 +1090,10 @@ jobs:
                   get_clang
                   check_defconfig
                   patch_swappiness
+                  patch_vm_tuning
+                  patch_dtb_append
                   patch_zram_compressor
+                  patch_zram_size
                   setup_nomount
                   [ "${INCREMENTAL:-0}" = "1" ] || cleanup
                   mkdir -p "${OUT_DIR}"
@@ -932,6 +1112,8 @@ jobs:
           KERNEL_BRANCH: ${{ inputs.kernel_branch }}
           KERNEL_REPO_TOKEN: ${{ inputs.private_repo_token || secrets.KERNEL_REPO_TOKEN }}
           NEMO_CONFIGS: ${{ inputs.defconfig }}
+          STABLE: ${{ inputs.stable_mode && '1' || '0' }}
+          VM_TUNE: ${{ inputs.vm_tune && '1' || '0' }}
           NOMOUNT: ${{ inputs.enable_nomount && '1' || '0' }}
           NOMOUNT_REF: ${{ inputs.nomount_ref }}
           LOCALVERSION: ${{ inputs.localversion }}
@@ -939,6 +1121,8 @@ jobs:
           SWAPPINESS_DEFAULT: ${{ inputs.swappiness_default == 'off' && '100' || inputs.swappiness_default }}
           SWAPPINESS_LOCK: ${{ inputs.swappiness_lock && '1' || '0' }}
           LOWRAM: ${{ inputs.lowram_mode == 'off' && '0' || '1' }}
+          LOWRAM_AGGRESSIVE: ${{ inputs.aggressive_debug_off && '1' || '0' }}
+          ZRAM_MIN_PERCENT: ${{ inputs.zram_size_percent }}
           ZRAM_COMP: ${{ inputs.lowram_mode == 'off' && 'lz4' || inputs.lowram_mode }}
           CLANG_TYPE: ${{ inputs.clang_toolchain }}
           GF_CLANG_VERSION: ${{ inputs.clang_version }}
@@ -964,7 +1148,10 @@ jobs:
           rel="$(cat "$src/out/include/config/kernel.release" 2>/dev/null || echo '?')"
           clang_bin="$(find "$HOME/work" -maxdepth 3 -path '*/bin/clang' \( -type f -o -type l \) 2>/dev/null | head -n1)"
           clang_ver="N/A"
+          clang_tag=""
           if [ -n "$clang_bin" ]; then
+            tagf="$(dirname "$(dirname "$clang_bin")")/.gf_tag"
+            [ -f "$tagf" ] && clang_tag="$(cat "$tagf")"
             clang_ver="$("$clang_bin" --version | head -n1 | sed -n 's/.*clang version \([0-9.]*\).*/\1/p')"
             [ -n "$clang_ver" ] || clang_ver="unknown"
           fi
@@ -975,6 +1162,8 @@ jobs:
             echo "ZIP_PATH=$zip"
             echo "KERNEL_RELEASE=$rel"
             echo "CLANG_INFO=$clang_ver"
+            echo "CLANG_TAG=$clang_tag"
+            echo "NOMOUNT_COMMIT=$(git -C "$src/NoMount" rev-parse --short HEAD 2>/dev/null || echo '-')"
             echo "BUILD_DURATION=$(( $(date +%s) - START_TS ))"
             echo "COMMIT_MSG=$(git -C "$src" log -1 --pretty=format:'%s' 2>/dev/null || echo '-')"
             echo "COMMIT_URL=${base}/commit/${full}"
@@ -1008,11 +1197,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CUSTOM_NOTE: ${{ inputs.custom_note }}
-          NOMOUNT_ON: ${{ inputs.enable_nomount && 'NoMount' || 'Normal' }}
+          NOMOUNT_ON: ${{ inputs.stable_mode && 'Stable' || (inputs.enable_nomount && 'NoMount' || 'Normal') }}
           NOMOUNT_REF_IN: ${{ inputs.nomount_ref }}
           SWAP_IN: ${{ inputs.swappiness_default }}
           SWAP_LOCK: ${{ inputs.swappiness_lock && 'locked' || 'unlocked' }}
           LOWRAM_IN: ${{ inputs.lowram_mode }}
+          ZRAM_PCT_IN: ${{ inputs.stable_mode && '0' || inputs.zram_size_percent }}
           CLANG_NAME: ${{ inputs.clang_toolchain }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
@@ -1023,9 +1213,11 @@ jobs:
 
           zipfile="$(basename "$ZIP_PATH")"
           variant="$NOMOUNT_ON"
-          [ "$NOMOUNT_ON" = "NoMount" ] && variant="NoMount (${NOMOUNT_REF_IN})"
+          [ "$NOMOUNT_ON" = "NoMount" ] && variant="NoMount (${NOMOUNT_REF_IN} @ ${NOMOUNT_COMMIT:--})"
           swap="off"
           [ "$SWAP_IN" != "off" ] && swap="${SWAP_IN} (${SWAP_LOCK})"
+          zr="$LOWRAM_IN"
+          [ "${ZRAM_PCT_IN:-0}" != "0" ] && zr="${LOWRAM_IN}, min ${ZRAM_PCT_IN}% RAM"
           cap="$(mktemp)"
           {
             printf '✅ *Build Successful* ✅\n\n'
@@ -1036,8 +1228,8 @@ jobs:
             printf '*Build Variant:* %s\n' "$(esc "$variant")"
             printf '*Kernel:* %s\n' "$(esc "$KERNEL_RELEASE")"
             printf '*Swappiness:* %s\n' "$(esc "$swap")"
-            printf '*Zram:* %s\n' "$(esc "$LOWRAM_IN")"
-            printf '*Clang:* %s\n' "$(esc "${CLANG_NAME^} $CLANG_INFO")"
+            printf '*Zram:* %s\n' "$(esc "$zr")"
+            printf '*Clang:* %s\n' "$(esc "${CLANG_NAME^} $CLANG_INFO${CLANG_TAG:+ (tag $CLANG_TAG)}")"
             if [ -n "$CUSTOM_NOTE" ]; then printf '\n*Note:* %s\n' "$(esc "$CUSTOM_NOTE")"; fi
             printf '\n[View Run](%s)\n' "$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
           } > "$cap"
@@ -1060,7 +1252,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CUSTOM_NOTE: ${{ inputs.custom_note }}
           IN_BRANCH: ${{ inputs.kernel_branch }}
-          NOMOUNT_ON: ${{ inputs.enable_nomount && 'NoMount' || 'Normal' }}
+          NOMOUNT_ON: ${{ inputs.stable_mode && 'Stable' || (inputs.enable_nomount && 'NoMount' || 'Normal') }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
           esc() { printf '%s' "$1" | sed 's/[]\_*[()~`>#+=|{}.!-]/\\&/g'; }
