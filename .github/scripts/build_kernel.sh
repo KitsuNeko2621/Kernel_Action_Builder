@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${KERNEL_DIR}"
 
 start_time=$(date +%s)
@@ -39,7 +41,7 @@ echo "=== Generating defconfig: ${DEFCONFIG} ===" | tee -a "$BUILD_LOG"
 make "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee -a "$BUILD_LOG"
 
 # Tweak .config: hemat RAM, kompresor zram, localversion, NoMount (hanya out/.config)
-source "$(dirname "$0")/kernel_config_tweaks.sh"
+source "${SCRIPT_DIR}/kernel_config_tweaks.sh"
 apply_kernel_config_tweaks
 
 # Generate header arch/uapi secara serial supaya tidak race dengan compile paralel
