@@ -38,6 +38,10 @@ mkdir -p out
 echo "=== Generating defconfig: ${DEFCONFIG} ===" | tee -a "$BUILD_LOG"
 make "${MAKE_ARGS[@]}" "${DEFCONFIG}" 2>&1 | tee -a "$BUILD_LOG"
 
+# Tweak .config: hemat RAM, kompresor zram, localversion, NoMount (hanya out/.config)
+source "$(dirname "$0")/kernel_config_tweaks.sh"
+apply_kernel_config_tweaks
+
 # Generate header arch/uapi secara serial supaya tidak race dengan compile paralel
 echo "=== Generating headers (serial) ===" | tee -a "$BUILD_LOG"
 make "${MAKE_ARGS[@]}" -j1 archheaders 2>&1 | tee -a "$BUILD_LOG"
@@ -61,6 +65,12 @@ make -j"$(nproc --all)" "${MAKE_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 
 grep -i -E "error:|undefined reference|fatal error" \
   "$BUILD_LOG" > "$ERROR_LOG" || true
+
+if [ -f out/include/config/kernel.release ]; then
+  KERNEL_RELEASE="$(cat out/include/config/kernel.release)"
+  echo "KERNEL_RELEASE=${KERNEL_RELEASE}" >> "$GITHUB_ENV"
+  echo "uname -r: ${KERNEL_RELEASE}" | tee -a "$BUILD_LOG"
+fi
 
 BUILD_DURATION=$(( $(date +%s) - start_time ))
 echo "BUILD_DURATION=${BUILD_DURATION}" >> "$GITHUB_ENV"

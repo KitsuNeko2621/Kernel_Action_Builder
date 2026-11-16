@@ -15,6 +15,7 @@ KSU_ESC=$(esc "${KSU_VARIANT}")
 RUN_URL_ESC=$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
 
 TOOLCHAIN_NAME="${CLANG_TOOLCHAIN:-Clang}"
+if [ -n "${CLANG_TAG}" ]; then TOOLCHAIN_NAME="${TOOLCHAIN_NAME} (tag ${CLANG_TAG})"; fi
 
 if [ -n "${CLANG_PATH}" ] && [ -x "${CLANG_PATH}/clang" ]; then
   CLANG_VER_STR=$("${CLANG_PATH}/clang" --version | head -n 1 | sed -n 's/.*clang version \([0-9.]*\).*/\1/p')
@@ -38,6 +39,16 @@ printf '*Time:* %s\n'        "${TIME_ESC}"                    >> "$CAPTION_FILE"
 printf '*Build Variant:* %s\n' "${VARIANT_ESC}"               >> "$CAPTION_FILE"
 printf '*KernelSU:* %s\n'    "${KSU_ESC}"                     >> "$CAPTION_FILE"
 printf '*Clang:* %s\n'       "${CLANG_ESC}"                   >> "$CAPTION_FILE"
+
+if [ -n "${KERNEL_RELEASE}" ]; then
+  printf '*Kernel:* %s\n' "$(esc "${KERNEL_RELEASE}")" >> "$CAPTION_FILE"
+fi
+if [ -n "${TWEAK_SUMMARY}" ]; then
+  printf '*Tweaks:* %s\n' "$(esc "${TWEAK_SUMMARY}")" >> "$CAPTION_FILE"
+fi
+if [ "${INPUT_ENABLE_NOMOUNT}" == "true" ]; then
+  printf '*NoMount:* %s\n' "$(esc "${INPUT_NOMOUNT_REF:-dev}")" >> "$CAPTION_FILE"
+fi
 
 if [ "${KSU_VARIANT}" != "Stock" ]; then
   printf '*Manager:* [Download](%s)\n' "$(esc_url "${KSU_REPO}/releases/latest")" >> "$CAPTION_FILE"
