@@ -1,0 +1,295 @@
+name: Build Kernel 4.14 (Neko)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel Repository URL'
+        required: true
+        type: string
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-nomount.git'
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        type: string
+        default: 'main'
+      defconfig:
+        description: 'Defconfig name (e.g. RM6785_defconfig)'
+        required: true
+        type: string
+        default: 'RM6785_defconfig'
+      private_repo_token:
+        description: 'GitHub Token (only if kernel repo is private)'
+        required: false
+        type: string
+        default: ''
+      enable_ksu:
+        description: 'Enable KernelSU'
+        required: true
+        type: boolean
+        default: false
+      ksu_variant:
+        description: 'KernelSU Variant (only if KSU enabled)'
+        required: false
+        type: choice
+        options:
+          - 'xxKSU'
+          - 'SukiSU'
+          - 'BakaSU'
+          - 'KernelSU-Next'
+          - 'KernelSU'
+        default: 'BakaSU'
+      enable_susfs:
+        description: 'Enable SUSFS'
+        required: false
+        type: boolean
+        default: false
+      enable_nomount:
+        description: 'Enable NoMount'
+        required: false
+        type: boolean
+        default: true
+      nomount_ref:
+        description: 'NoMount: branch / tag / commit'
+        required: false
+        type: string
+        default: 'dev'
+      localversion:
+        description: 'Nama versi kernel (uname -r), tanpa spasi'
+        required: false
+        type: string
+        default: '-NekoKernel'
+      swappiness_default:
+        description: 'Swappiness default 0-200 (maks dinaikkan jadi 200), isi off untuk tidak mengubah swappiness'
+        required: false
+        type: string
+        default: '150'
+      swappiness_lock:
+        description: 'Kunci swappiness (/proc/sys/vm/swappiness jadi 0444 read-only, tidak bisa diubah setelah boot, ROM/tweak tidak bisa menimpa)'
+        required: true
+        type: boolean
+        default: true
+      lowram_mode:
+        description: 'Mode hemat RAM + kompresor zram default (off = matikan mode hemat RAM)'
+        required: true
+        type: choice
+        options:
+          - 'lz4'
+          - 'zstd'
+          - 'lz4hc'
+          - 'lzo'
+          - 'off'
+        default: 'lz4'
+      zram_size_percent:
+        description: 'Ukuran zram MINIMUM (% dari RAM). 0 = tidak diubah. 100 = sebesar RAM, 150 = 1,5x RAM, 200 = 2x RAM (maks 200)'
+        required: true
+        type: string
+        default: '100'
+      vm_tune:
+        description: 'Tuning RAM untuk zram + gaming (page-cluster 0, watermark_scale_factor 30)'
+        required: true
+        type: boolean
+        default: true
+      aggressive_debug_off:
+        description: 'Mode hemat RAM juga mematikan SCHEDSTATS & KPROBES (sedikit lebih ringan, tapi lebih berisiko bootloop). Default OFF'
+        required: true
+        type: boolean
+        default: false
+      clang_toolchain:
+        description: 'Toolchain Clang'
+        required: true
+        type: choice
+        options:
+          - 'greenforce'
+          - 'neutron'
+        default: 'greenforce'
+      clang_version:
+        description: 'Greenforce Clang: latest | angka major (mis. 17) | tag rilis. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
+        required: false
+        type: string
+        default: '24122023'
+      zip_name:
+        description: 'Awalan nama ZIP'
+        required: false
+        type: string
+        default: 'Miku'
+      custom_note:
+        description: 'Catatan build (opsional, ikut ke Telegram)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      LC_ALL: C
+      USE_CCACHE: 1
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ANYKERNEL_REPO: "https://github.com/elohim-etz/AnyKernel3.git"
+      ANYKERNEL_BRANCH: "master"
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # ── Build environment ─────────────────────────────────────────────────
+      - name: Set up Build Environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev \
+            gcc clang lld libncurses5-dev git zip unzip \
+            curl wget time ccache libelf-dev libfdt-dev \
+            python3 python3-pip zstd lz4 cpio xz-utils \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      # ── ccache ───────────────────────────────────────────────
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-kernel-${{ github.run_id }}
+          restore-keys: |
+            ccache-kernel-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=5G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=1
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      # ── Kernel source ─────────────────────────────────────────────────────
+      - name: Clone Kernel Source
+        env:
+          INPUT_KERNEL_REPO:   ${{ github.event.inputs.kernel_repo }}
+          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+          INPUT_PRIVATE_TOKEN: ${{ github.event.inputs.private_repo_token }}
+          INPUT_DEFCONFIG:     ${{ github.event.inputs.defconfig }}
+        run: bash .github/scripts/clone_kernel.sh
+
+      # ── NoMount (setup script, sama seperti KSU) ──────────────────────────
+      - name: Setup NoMount
+        if: github.event.inputs.enable_nomount == 'true'
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel
+        env:
+          NOMOUNT_REF: ${{ github.event.inputs.nomount_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f Makefile ] || [ ! -d fs ]; then
+            echo "::error::Kernel source tree tidak ditemukan di $PWD. Cek .github/scripts/clone_kernel.sh."
+            exit 1
+          fi
+
+          # Kalau kernel repo sudah punya fs/nomount sebagai folder biasa,
+          # hapus dulu, kalau tidak symlink akan dibuat DI DALAM folder itu.
+          if [ -d fs/nomount ] && [ ! -L fs/nomount ]; then
+            echo "Removing existing fs/nomount directory"
+            rm -rf fs/nomount
+          fi
+
+          NOMOUNT_REF="${NOMOUNT_REF:-dev}"
+          curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s -- "$NOMOUNT_REF"
+
+          # Verifikasi hasil setup
+          test -e fs/nomount/Kconfig || { echo "::error::NoMount setup gagal (fs/nomount/Kconfig tidak ada)"; exit 1; }
+          grep -q 'nomount' fs/Makefile || { echo "::error::fs/Makefile tidak memuat nomount"; exit 1; }
+          grep -q 'fs/nomount/Kconfig' fs/Kconfig || { echo "::error::fs/Kconfig tidak memuat nomount"; exit 1; }
+
+          echo "NoMount installed:"
+          ls -la fs/nomount
+
+      # ── Clang toolchain (greenforce / neutron) ───────────────────────────
+      - name: Setup Clang Toolchain
+        env:
+          CLANG_TOOLCHAIN_INPUT: ${{ github.event.inputs.clang_toolchain }}
+          INPUT_CLANG_VERSION:   ${{ github.event.inputs.clang_version }}
+          GITHUB_TOKEN:          ${{ github.token }}
+        run: bash .github/scripts/setup_toolchain.sh
+
+      # ── AnyKernel3 ─────────────────────────
+      - name: Clone AnyKernel3
+        run: git clone --depth=1 "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH" AnyKernel
+
+      # ── KernelSU / variant selection ──────────────────────────────────────
+      - name: Setup KernelSU / Build Variant
+        env:
+          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
+          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
+        run: bash .github/scripts/setup_ksu.sh
+
+      # ── Logs ─────────────────────────────────────────────────────────────
+      - name: Prepare Log Paths
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          echo "BUILD_LOG=$GITHUB_WORKSPACE/logs/build.log"   >> $GITHUB_ENV
+          echo "ERROR_LOG=$GITHUB_WORKSPACE/logs/errors.log"  >> $GITHUB_ENV
+
+      # ── Tweak source: swappiness, zram, VM tuning ─────────────────────────
+      - name: Apply Kernel Tweaks (swappiness / zram / VM)
+        env:
+          INPUT_SWAPPINESS_DEFAULT:   ${{ github.event.inputs.swappiness_default }}
+          INPUT_SWAPPINESS_LOCK:      ${{ github.event.inputs.swappiness_lock }}
+          INPUT_LOWRAM_MODE:          ${{ github.event.inputs.lowram_mode }}
+          INPUT_ZRAM_SIZE_PERCENT:    ${{ github.event.inputs.zram_size_percent }}
+          INPUT_VM_TUNE:              ${{ github.event.inputs.vm_tune }}
+          INPUT_AGGRESSIVE_DEBUG_OFF: ${{ github.event.inputs.aggressive_debug_off }}
+          INPUT_LOCALVERSION:         ${{ github.event.inputs.localversion }}
+        run: bash .github/scripts/apply_source_tweaks.sh
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build Kernel
+        env:
+          INPUT_ENABLE_NOMOUNT: ${{ github.event.inputs.enable_nomount }}
+        run: bash .github/scripts/build_kernel.sh
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            ${{ env.BUILD_LOG }}
+            ${{ env.ERROR_LOG }}
+            ${{ github.workspace }}/logs/rej
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Check Build Output
+        run: bash .github/scripts/check_output.sh
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package with AnyKernel3
+        env:
+          ZIP_NAME_PREFIX: ${{ github.event.inputs.zip_name }}
+        run: bash .github/scripts/package_zip.sh
+
+      # ── Telegram notifications ────────────────────────────────────────────
+      - name: Send Kernel ZIP to Telegram
+        if: success()
+        env:
+          CUSTOM_NOTE:          ${{ github.event.inputs.custom_note }}
+          INPUT_ENABLE_NOMOUNT: ${{ github.event.inputs.enable_nomount }}
+          INPUT_NOMOUNT_REF:    ${{ github.event.inputs.nomount_ref }}
+        run: bash .github/scripts/notify_success.sh
+
+      - name: Send Failure Notification to Telegram
+        if: failure()
+        env:
+          CUSTOM_NOTE:       ${{ github.event.inputs.custom_note }}
+          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
+          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
+          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+        run: bash .github/scripts/notify_failure.sh
