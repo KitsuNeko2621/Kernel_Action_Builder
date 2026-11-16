@@ -55,7 +55,7 @@ on:
         description: 'Swappiness default 0-200 (maks dinaikkan jadi 200), isi off untuk tidak mengubah swappiness'
         required: false
         type: string
-        default: '100'
+        default: '150'
       swappiness_lock:
         description: 'Kunci swappiness (read-only, tidak bisa diubah setelah boot). Disarankan OFF: ROM/tweak masih bisa menyesuaikan'
         required: true
@@ -76,7 +76,7 @@ on:
         description: 'Ukuran zram MINIMUM (% dari RAM). 0 = tidak diubah (ROM-mu sekarang 75%). 100 = sebesar RAM, 150 = 1,5x RAM, 200 = 2x RAM (maks 200)'
         required: true
         type: string
-        default: '150'
+        default: '100'
       aggressive_debug_off:
         description: 'Mode hemat RAM juga mematikan SCHEDSTATS & KPROBES (sedikit lebih ringan, tapi lebih berisiko bootloop). Default OFF'
         required: true
@@ -230,7 +230,7 @@ jobs:
           # 1 = patch source: batas swappiness 100 -> 200 (sysctl & memcg), default diatur di bawah
           SWAPPINESS_PATCH="${SWAPPINESS_PATCH:-1}"
           # Nilai default saat boot (0-200). Kalau SWAPPINESS_LOCK=1, ini jadi nilai TETAP.
-          SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-100}"
+          SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-150}"
           # 1 = kunci: /proc/sys/vm/swappiness jadi 0444 (read-only, root pun tidak bisa menulis) dan
           #     tulis ke memory.swappiness cgroup ROOT diabaikan (tetap dianggap sukses, tidak mengubah nilai)
           SWAPPINESS_LOCK="${SWAPPINESS_LOCK:-0}"
