@@ -1,7 +1,6 @@
-name: Build Kernel Nemo (NoMount)
+name: Build Kernel Nemo (Experiment)
 
 # Workflow mandiri: tidak memerlukan file lain di repo (.github/scripts, submodule, dsb).
-# Versi ini: membuat dtbo.img dari source (3 overlay nemo) dan ikut diflash lewat zip AnyKernel.
 # Isi build.sh ditanam di step "Tulis build.sh" di bawah.
 
 on:
@@ -31,7 +30,17 @@ on:
         description: 'Aktifkan NoMount'
         required: true
         type: boolean
+        default: true
+      stable_mode:
+        description: 'Mode stabil: matikan NoMount, mode hemat RAM, dan patch swappiness (untuk pembanding saat bootloop)'
+        required: true
+        type: boolean
         default: false
+      vm_tune:
+        description: 'Tuning RAM untuk zram + gaming (page-cluster 0, watermark_scale_factor 30)'
+        required: true
+        type: boolean
+        default: true
       nomount_ref:
         description: 'NoMount: branch / tag / commit'
         required: false
@@ -46,9 +55,9 @@ on:
         description: 'Swappiness default 0-200 (maks dinaikkan jadi 200), isi off untuk tidak mengubah swappiness'
         required: false
         type: string
-        default: 'off'
+        default: '150'
       swappiness_lock:
-        description: 'Kunci swappiness (read-only, tidak bisa diubah setelah boot)'
+        description: 'Kunci swappiness (/proc/sys/vm/swappiness jadi 0444 read-only, tidak bisa diubah setelah boot, ROM/tweak tidak bisa menimpa)'
         required: true
         type: boolean
         default: true
@@ -62,19 +71,24 @@ on:
           - 'lz4hc'
           - 'lzo-rle'
           - 'off'
-        default: 'off'
-      build_dtbo:
-        description: 'Buat dtbo.img dari source (3 overlay nemo) dan ikut diflash lewat zip'
+        default: 'lz4'
+      zram_size_percent:
+        description: 'Ukuran zram MINIMUM (% dari RAM). 0 = tidak diubah (ROM-mu sekarang 75%). 100 = sebesar RAM, 150 = 1,5x RAM, 200 = 2x RAM (maks 200)'
         required: true
-        type: boolean
-        default: true
-      replace_dtb_section:
-        description: 'Ganti bagian DTB di boot.img dengan DTB build ini (diperlukan: bootloader memakai DTB boot.img, bukan yang menempel di kernel)'
+        type: string
+        default: '100'
+      gpu_max_khz:
+        description: 'GPU (Mali-G76, segmen G90T) frekuensi tertinggi dalam kHz. 0 = tidak diubah (stock 806000). Hanya OPP yang sudah ada di tabel: 821000 atau 835000'
         required: true
-        type: boolean
-        default: true
-      disable_lto:
-        description: 'Matikan LTO/CFI (build jauh lebih cepat, untuk tes)'
+        type: string
+        default: '821000'
+      cpu_big_max_khz:
+        description: 'EKSPERIMENTAL: CPU A76 (cluster besar, G90T) frekuensi tertinggi dalam kHz, 2050000-2100000. Voltase TIDAK dinaikkan (sudah di batas 1.11875 V). 0 = tidak diubah (stock 2050000)'
+        required: true
+        type: string
+        default: '0'
+      aggressive_debug_off:
+        description: 'Mode hemat RAM juga mematikan SCHEDSTATS & KPROBES (sedikit lebih ringan, tapi lebih berisiko bootloop). Default OFF'
         required: true
         type: boolean
         default: false
@@ -87,7 +101,7 @@ on:
           - 'neutron'
         default: 'greenforce'
       clang_version:
-        description: 'Greenforce Clang: latest | angka major (mis. 19) | tag rilis'
+        description: 'Greenforce Clang: latest | angka major (mis. 19) | tag rilis. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
         required: false
         type: string
         default: 'latest'
@@ -128,10 +142,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git make bc bison flex libssl-dev libelf-dev python3 zip unzip curl wget \
             cpio xz-utils zstd lz4 ccache build-essential libncurses-dev \
-            device-tree-compiler binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
-      - name: Pulihkan cache ccache
-        uses: actions/cache/restore@v4
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
           path: ~/.ccache
           key: ccache-nemo-${{ github.run_id }}
@@ -207,35 +221,29 @@ jobs:
           #     Tanpa ini, Makefile 4.19 ikut menempelkan 3 file overlay .dtbo ke dalam Image.gz-dtb.
           DTB_ONLY="${DTB_ONLY:-1}"
 
-          # --- dtbo.img --------------------------------------------------------------------
-          # 1 = buat dtbo.img dari overlay hasil build ini dan flash bersama kernel (partisi dtbo).
-          #     Wajib kalau ROM aslinya berbasis kernel 4.14: dtbo lama TIDAK cocok dengan DTB 4.19.
-          # Format "path-relatif-dari-dts:id" sesuai configs/dtbo/dtbo.cfg di device tree nemo.
-          BUILD_DTBO="${BUILD_DTBO:-1}"
-          DTBO_ENTRIES="${DTBO_ENTRIES:-mediatek/oppo6785_20682.dtbo:0 mediatek/oppo6785_20684.dtbo:1 mediatek/oppo6785_19661.dtbo:2}"
-
-          # 1 = ganti bagian DTB di boot.img (header v2) dengan mt6785.dtb hasil build ini.
-          #     Di ROM A13 lama, bootloader memakai DTB di boot.img (terlihat dari /proc/device-tree/shell_front),
-          #     bukan DTB yang menempel di Image.gz-dtb. Tanpa ini kernel 4.19 mendapat DTB 4.14 lama.
-          NEKO_REPLACE_DTB="${NEKO_REPLACE_DTB:-1}"
-
-          # 1 = matikan LTO/CFI/ShadowCallStack di .config (kompilasi jauh lebih cepat, untuk tes)
-          NEKO_NO_LTO="${NEKO_NO_LTO:-0}"
-
           # --- Mode hemat RAM (cocok untuk RAM 4GB) ----------------------------------------
           # 1 = aktifkan: matikan DEBUG_INFO / SCHEDSTATS / KPROBES, perkecil log buffer kernel (128 KB),
           #     dan ganti kompresor zram default
           LOWRAM="${LOWRAM:-1}"
+          # 1 = mode hemat RAM juga mematikan SCHEDSTATS & KPROBES. Default 0 (konservatif): hanya DEBUG_INFO yang dimatikan.
+          LOWRAM_AGGRESSIVE="${LOWRAM_AGGRESSIVE:-0}"
           # Kompresor zram default: lz4 (cepat, UI mulus) | zstd (rasio lebih baik, CPU lebih berat) |
           #                         lz4hc | lzo | lzo-rle (bawaan kernel). ROM yang menulis
           #                         /sys/block/zram0/comp_algorithm tetap menimpa nilai ini.
           ZRAM_COMP="${ZRAM_COMP:-lz4}"
+          # Ukuran zram MINIMUM, % dari RAM total (0 = tidak diubah). Ukuran zram sebenarnya ditulis userspace
+          # (fstab: zramsize=75%) ke /sys/block/zram0/disksize; patch ini menaikkannya ke minimal nilai ini,
+          # berapa pun yang diminta ROM. Nilai lebih kecil dari ini tidak bisa diset setelah boot.
+          ZRAM_MIN_PERCENT="${ZRAM_MIN_PERCENT:-0}"
+          # Frekuensi tertinggi GPU / CPU besar (kHz, 0 = tidak diubah). Lihat patch_opp.
+          GPU_MAX_KHZ="${GPU_MAX_KHZ:-0}"
+          CPU_BIG_MAX_KHZ="${CPU_BIG_MAX_KHZ:-0}"
 
           # --- Swappiness ---------------------------------------------------------------
           # 1 = patch source: batas swappiness 100 -> 200 (sysctl & memcg), default diatur di bawah
           SWAPPINESS_PATCH="${SWAPPINESS_PATCH:-1}"
           # Nilai default saat boot (0-200). Kalau SWAPPINESS_LOCK=1, ini jadi nilai TETAP.
-          SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-180}"
+          SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-150}"
           # 1 = kunci: /proc/sys/vm/swappiness jadi 0444 (read-only, root pun tidak bisa menulis) dan
           #     tulis ke memory.swappiness cgroup ROOT diabaikan (tetap dianggap sukses, tidak mengubah nilai)
           SWAPPINESS_LOCK="${SWAPPINESS_LOCK:-1}"
@@ -243,6 +251,29 @@ jobs:
           AK_AUTHOR="${AK_AUTHOR:-KitsuNeko}"      # tampil sebagai "By <AK_AUTHOR>" (disarankan 12 karakter agar bingkai lurus)
           # Kode model yang boleh flash (do.devicecheck=1). Spasi sebagai pemisah.
           AK_DEVICES="${AK_DEVICES:-RMX2151 rmx2151 RMX2161 rmx2161 RMX2001 rmx2001 RMX2002 rmx2002 RMX2002L1 rmx2002L1 RMX2001L1 rmx2001L1 RMX2003 RMX2153 RMX2153L1 RMX2156 RMX2163 RMX2161L1 RMX2163L1 RMX3031 IN2023 GM1917 RM6785 rm6785 wasabi}"
+
+          # --- Tuning manajemen RAM (zram + gaming) -----------------------------------------
+          # 1 = aktifkan patch default VM di bawah (nilainya tetap bisa diubah lewat /proc/sys/vm/ saat runtime)
+          VM_TUNE="${VM_TUNE:-1}"
+          # page-cluster 0: swap-in dari zram membaca 1 halaman, bukan 8 (bawaan kernel 3). Standar untuk zram.
+          VM_PAGE_CLUSTER="${VM_PAGE_CLUSTER:-0}"
+          # watermark_scale_factor: jarak watermark kswapd (bawaan 10 = 0,1% RAM). Lebih besar = kswapd bangun
+          # lebih awal sehingga direct reclaim (penyebab stutter) berkurang, dengan biaya sedikit RAM bebas.
+          VM_WATERMARK_SCALE="${VM_WATERMARK_SCALE:-30}"
+
+          # --- Mode stabil -------------------------------------------------------------------
+          # 1 = build konservatif: matikan semua tambahan (NoMount, mode hemat RAM, patch swappiness).
+          #     Berguna sebagai pembanding saat mencari penyebab bootloop. Patch DTB tetap berlaku.
+          STABLE="${STABLE:-0}"
+          if [ "${STABLE}" = "1" ]; then
+              NOMOUNT=0
+              LOWRAM=0
+              SWAPPINESS_PATCH=0
+              VM_TUNE=0
+              ZRAM_MIN_PERCENT=0
+              GPU_MAX_KHZ=0
+              CPU_BIG_MAX_KHZ=0
+          fi
 
           if [ -f "${PWD}/Makefile" ] && [ -d "${PWD}/arch/arm64" ]; then
               KERNEL_DIR="${PWD}"
@@ -281,7 +312,7 @@ jobs:
           # ========================
           check_deps() {
               log_info "Memeriksa dependensi sistem..."
-              local deps=(git make bc bison flex libssl-dev libelf-dev python3 zip curl wget cpio xz-utils zstd lz4 ccache build-essential libncurses-dev device-tree-compiler binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi)
+              local deps=(git make bc bison flex libssl-dev libelf-dev python3 zip curl wget cpio xz-utils zstd lz4 ccache build-essential libncurses-dev binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi)
               local missing=()
               for dep in "${deps[@]}"; do
                   dpkg -s "$dep" &>/dev/null || missing+=("$dep")
@@ -619,6 +650,29 @@ jobs:
           PY
           }
 
+          # Default VM untuk zram + gaming (idempoten). Nilai tetap bisa diubah saat runtime lewat sysctl.
+          patch_vm_tuning() {
+              [ "${VM_TUNE}" = "1" ] || return 0
+              local v
+              for v in "${VM_PAGE_CLUSTER}:0:6:VM_PAGE_CLUSTER" "${VM_WATERMARK_SCALE}:1:1000:VM_WATERMARK_SCALE"; do
+                  local val="${v%%:*}" rest="${v#*:}"
+                  local lo="${rest%%:*}"; rest="${rest#*:}"
+                  local hi="${rest%%:*}" name="${rest#*:}"
+                  if ! [[ "${val}" =~ ^[0-9]+$ ]] || [ "${val}" -lt "${lo}" ] || [ "${val}" -gt "${hi}" ]; then
+                      log_error "${name} harus angka ${lo}-${hi} (sekarang: '${val}')"
+                      exit 1
+                  fi
+              done
+              local swp="${KERNEL_DIR}/mm/swap.c" pga="${KERNEL_DIR}/mm/page_alloc.c"
+              if grep -qE '^[[:space:]]+page_cluster = [0-9]+;' "${swp}" && grep -qE '^int watermark_scale_factor = [0-9]+;' "${pga}"; then
+                  sed -i -E "s/^([[:space:]]+page_cluster = )[0-9]+;/\1${VM_PAGE_CLUSTER};/" "${swp}"
+                  sed -i -E "s/^(int watermark_scale_factor = )[0-9]+;/\1${VM_WATERMARK_SCALE};/" "${pga}"
+                  log_info "VM tuning: page-cluster=${VM_PAGE_CLUSTER}, watermark_scale_factor=${VM_WATERMARK_SCALE}"
+              else
+                  log_warn "Pola kode VM (swap.c / page_alloc.c) tidak dikenali, VM tuning dilewati."
+              fi
+          }
+
           # Patch swappiness langsung di source (idempoten: aman dijalankan berulang kali)
           patch_swappiness() {
               [ "${SWAPPINESS_PATCH}" = "1" ] || return 0
@@ -765,13 +819,151 @@ jobs:
               fi
           }
 
+          # Ukuran zram minimum (idempoten). Gagal mengenali pola kode -> hanya peringatan, build lanjut.
+          patch_zram_size() {
+              [ "${ZRAM_MIN_PERCENT}" = "0" ] && return 0
+              if ! [[ "${ZRAM_MIN_PERCENT}" =~ ^[0-9]+$ ]] || [ "${ZRAM_MIN_PERCENT}" -gt 200 ]; then
+                  log_error "ZRAM_MIN_PERCENT harus angka 0-200 (sekarang: '${ZRAM_MIN_PERCENT}')"
+                  exit 1
+              fi
+              local f="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
+              [ -f "${f}" ] || { log_warn "zram_drv.c tidak ditemukan, ukuran zram tidak diubah."; return 0; }
+              python3 - "${f}" "${ZRAM_MIN_PERCENT}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+          import re, sys
+          p, pct = sys.argv[1], sys.argv[2]
+          s = open(p).read()
+          define = f"#define NEKO_ZRAM_MIN_PCT {pct}\n"
+          if "NEKO_ZRAM_MIN_PCT" in s:
+              open(p, "w").write(re.sub(r"#define NEKO_ZRAM_MIN_PCT \d+\n", define, s, count=1))
+              print(f"[PATCH] zram_drv.c: ukuran minimum zram diperbarui -> {pct}% RAM (sudah dipatch sebelumnya)")
+              sys.exit(0)
+          inc = '#include "zram_drv.h"\n'
+          m = re.search(r"(\tdisksize = memparse\(buf, NULL\);\n\tif \(!disksize\)\n\t\treturn -EINVAL;\n)", s)
+          if inc not in s or not m:
+              print("[WARN] zram_drv.c: pola disksize_store tidak dikenali, ukuran zram tidak diubah")
+              sys.exit(3)
+          block = (
+              "\n\t/* NEKO: ukuran zram minimum = NEKO_ZRAM_MIN_PCT% dari RAM (ROM boleh minta lebih besar) */\n"
+              "\t{\n"
+              "\t\tstruct sysinfo neko_si;\n"
+              "\t\tu64 neko_min;\n\n"
+              "\t\tsi_meminfo(&neko_si);\n"
+              "\t\tneko_min = (u64)neko_si.totalram * neko_si.mem_unit / 100 * NEKO_ZRAM_MIN_PCT;\n"
+              "\t\tif (disksize < neko_min)\n"
+              "\t\t\tdisksize = neko_min;\n"
+              "\t}\n"
+          )
+          s = s.replace(inc, inc + define, 1)
+          s = s.replace(m.group(1), m.group(1) + block, 1)
+          open(p, "w").write(s)
+          print(f"[PATCH] zram_drv.c: ukuran minimum zram = {pct}% dari RAM")
+          PY
+              [ "${PIPESTATUS[0]}" -eq 0 ] || log_warn "Patch ukuran zram dilewati (lihat pesan di atas)."
+          }
+
+          # Frekuensi tertinggi GPU/CPU lewat tabel OPP driver MediaTek (mt6785). Lokasi file dicari dari
+          # nama simbol, bukan path tetap. Gagal/ambigu -> build dihentikan (agar tidak salah mengira OC aktif).
+          patch_opp() {
+              [ "${GPU_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_MAX_KHZ}" = "0" ] && return 0
+              local v
+              for v in "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}"; do
+                  [[ "${v}" =~ ^[0-9]+$ ]] || { log_error "GPU_MAX_KHZ/CPU_BIG_MAX_KHZ harus angka kHz (sekarang: '${v}')"; exit 1; }
+              done
+              log_info "Patch OPP: GPU max=${GPU_MAX_KHZ} kHz, CPU A76 max=${CPU_BIG_MAX_KHZ} kHz (0 = tidak diubah)"
+              python3 - "${KERNEL_DIR}" "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+          import re, subprocess, sys
+          root, gpu_khz, cpu_khz = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          failed = False
+
+          def err(msg):
+              global failed
+              failed = True
+              print(f"[ERROR] {msg}")
+
+          def find(pattern, glob):
+              r = subprocess.run(["grep", "-rlE", "--include=" + glob, pattern, root + "/drivers"],
+                                 capture_output=True, text=True)
+              return sorted(r.stdout.split())
+
+          def only(files, what):
+              if len(files) != 1:
+                  err(f"{what}: ditemukan {len(files)} file ({', '.join(files) or '-'}), harus tepat 1")
+                  return None
+              return files[0]
+
+          # ---- GPU: naikkan OPP tertinggi segmen MT6785T (G90T), hanya ke OPP yang SUDAH ada di tabel ----
+          if gpu_khz:
+              h = only(find(r"SEG_GPU_DVFS_FREQ0\b", "*.h"), "tabel OPP GPU (SEG_GPU_DVFS_FREQ0)")
+              c = None
+              if h:
+                  c = only([f for f in find(r"g_segment_max_opp_idx = [0-9]+;", "*.c")
+                            if "MT6785T_SEGMENT" in open(f).read()], "driver gpufreq (MT6785T_SEGMENT)")
+              if h and c:
+                  idx_of = {int(m.group(2)): int(m.group(1)) for m in
+                            re.finditer(r"#define\s+SEG_GPU_DVFS_FREQ(\d+)\s*\((\d+)\)", open(h).read())}
+                  if gpu_khz not in idx_of:
+                      err(f"GPU {gpu_khz} kHz bukan OPP yang ada di tabel (OPP 13-15: "
+                          f"{', '.join(str(k) for k, v in sorted(idx_of.items()) if 13 <= v <= 15)})")
+                  elif not 13 <= idx_of[gpu_khz] <= 15:
+                      err(f"GPU {gpu_khz} kHz = OPP {idx_of[gpu_khz]}; hanya OPP 13-15 yang diizinkan "
+                          f"(di atas itu tidak divalidasi untuk segmen G90T)")
+                  else:
+                      idx = idx_of[gpu_khz]
+                      src = open(c).read()
+                      pat = re.compile(r"(else if \(g_segment_id == MT6785T_SEGMENT\)\s*\n\s*g_segment_max_opp_idx = )(\d+)(;)")
+                      if not pat.search(src):
+                          err("pola g_segment_max_opp_idx untuk MT6785T tidak ditemukan")
+                      else:
+                          open(c, "w").write(pat.sub(lambda m: m.group(1) + str(idx) + m.group(3), src, count=1))
+                          print(f"[PATCH] {c.replace(root + '/', '')}: GPU G90T OPP tertinggi = OPP {idx} ({gpu_khz} kHz)")
+
+          # ---- CPU: A76 (cluster "L") segmen 6785T, OPP0. Frekuensi saja; voltase TIDAK diubah ----
+          if cpu_khz:
+              if cpu_khz % 1000 or not 2050000 <= cpu_khz <= 2100000:
+                  err(f"CPU_BIG_MAX_KHZ={cpu_khz}: harus kelipatan 1000 dan di antara 2050000-2100000")
+              else:
+                  o = only(find(r"CPU_DVFS_FREQ0_L_6785T\b", "*.h"), "tabel OPP CPU (CPU_DVFS_FREQ0_L_6785T)")
+                  p = only(find(r"FY_6785TTbl\b", "*.h"), "tabel PV CPU (FY_6785TTbl)")
+                  if o and p:
+                      s = open(o).read()
+                      m = re.search(r"(#define\s+CPU_DVFS_FREQ0_L_6785T\s+)(\d+)", s)
+                      if not m or int(m.group(2)) not in (2050000, cpu_khz):
+                          err(f"CPU_DVFS_FREQ0_L_6785T bernilai tak terduga ({m.group(2) if m else '?'})")
+                      else:
+                          s = s[:m.start(2)] + str(cpu_khz) + s[m.end(2):]
+                          t = open(p).read()
+                          blk = re.search(r"static unsigned int FY_6785TTbl\[.*?\n\};", t, re.S)
+                          row = re.search(r"(/\* L \*/\s*\n\s*\{\s*)(\d+)(,\s*115,\s*1,\s*1\s*\})", blk.group(0)) if blk else None
+                          mhz = cpu_khz // 1000
+                          if not row or int(row.group(2)) not in (2050, mhz):
+                              err("baris OPP0 cluster L di FY_6785TTbl tidak cocok (2050, 115, 1, 1)")
+                          else:
+                              new_blk = blk.group(0)[:row.start(2)] + str(mhz) + blk.group(0)[row.end(2):]
+                              t = t[:blk.start()] + new_blk + t[blk.end():]
+                              open(o, "w").write(s)
+                              open(p, "w").write(t)
+                              print(f"[PATCH] CPU A76 (6785T) OPP0 = {cpu_khz} kHz di tabel OPP dan PV; voltase tetap 1.11875 V")
+
+          sys.exit(1 if failed else 0)
+          PY
+              [ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "Patch OPP gagal, build dihentikan."; exit 1; }
+          }
+
           # Opsi config hemat RAM, diterapkan ke out/.config (tidak mengubah file defconfig di source)
           apply_lowram_config() {
               [ "${LOWRAM}" = "1" ] || return 0
               local cfg="${OUT_DIR}/.config" sc="${KERNEL_DIR}/scripts/config"
               local cur_shift; cur_shift=$(sed -n 's/^CONFIG_LOG_BUF_SHIFT=//p' "${cfg}")
-              log_info "Mode hemat RAM: DEBUG_INFO/SCHEDSTATS/KPROBES dimatikan, log buffer maks 128 KB"
-              bash "${sc}" --file "${cfg}" -d DEBUG_INFO -d SCHEDSTATS -d KPROBES
+              if [ "${LOWRAM_AGGRESSIVE}" = "1" ]; then
+                  log_info "Mode hemat RAM (agresif): DEBUG_INFO/SCHEDSTATS/KPROBES dimatikan, log buffer maks 128 KB"
+              else
+                  log_info "Mode hemat RAM: hanya DEBUG_INFO dimatikan (SCHEDSTATS/KPROBES dibiarkan), log buffer maks 128 KB"
+              fi
+              if [ "${LOWRAM_AGGRESSIVE}" = "1" ]; then
+                  bash "${sc}" --file "${cfg}" -d DEBUG_INFO -d SCHEDSTATS -d KPROBES
+              else
+                  bash "${sc}" --file "${cfg}" -d DEBUG_INFO
+              fi
               # log buffer hanya diperkecil, tidak pernah diperbesar
               if [ -z "${cur_shift}" ] || [ "${cur_shift}" -gt 17 ]; then
                   bash "${sc}" --file "${cfg}" --set-val LOG_BUF_SHIFT 17
@@ -796,7 +988,8 @@ jobs:
               make "${MAKE_ARGS[@]}" olddefconfig >>"${LOG_FILE}" 2>&1 || { log_error "olddefconfig gagal."; exit 1; }
               # Periksa hasilnya (sebagian opsi bisa dipaksa aktif oleh Kconfig lain)
               local opt
-              for opt in DEBUG_INFO SCHEDSTATS KPROBES; do
+              local opts="DEBUG_INFO"; [ "${LOWRAM_AGGRESSIVE}" = "1" ] && opts="DEBUG_INFO SCHEDSTATS KPROBES"
+              for opt in ${opts}; do
                   grep -q "^CONFIG_${opt}=y" "${cfg}" && log_warn "CONFIG_${opt} tetap aktif (dipaksa oleh opsi lain)."
               done
               if [ "${ZRAM_COMP_MODE:-}" = "kconfig" ] && ! grep -q "^CONFIG_ZRAM_DEF_COMP=\"${ZRAM_COMP}\"" "${cfg}"; then
@@ -835,7 +1028,6 @@ jobs:
               apply_localversion
               apply_lowram_config
               apply_nomount_config
-              apply_lto_config
               fix_compat_vdso
 
               # Header arch/uapi dibuat serial dulu supaya tidak balapan dengan kompilasi paralel
@@ -867,77 +1059,6 @@ jobs:
               [ -f "${OUT_DIR}/include/config/kernel.release" ] && \
                   log_info "Versi kernel (uname -r): $(cat "${OUT_DIR}/include/config/kernel.release")"
               log_info "Waktu: $((diff / 60)) menit $((diff % 60)) detik"
-          }
-
-          # Matikan LTO/CFI (opsional) supaya kompilasi jauh lebih cepat. Hanya untuk build tes.
-          apply_lto_config() {
-              [ "${NEKO_NO_LTO}" = "1" ] || return 0
-              local cfg="${OUT_DIR}/.config" sc="${KERNEL_DIR}/scripts/config"
-              log_info "Mematikan LTO/CFI/ShadowCallStack (build lebih cepat)"
-              bash "${sc}" --file "${cfg}" -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_PERMISSIVE -d SHADOW_CALL_STACK
-              make "${MAKE_ARGS[@]}" olddefconfig >>"${LOG_FILE}" 2>&1 || { log_error "olddefconfig gagal."; exit 1; }
-              grep -q '^CONFIG_LTO_CLANG=y' "${cfg}" && log_warn "CONFIG_LTO_CLANG tetap aktif (dipaksa oleh opsi lain)."
-              return 0
-          }
-
-          # Susun dtbo.img (format DTBO table v0, sama dengan dtbo ROM) dari overlay hasil build.
-          build_dtbo_img() {
-              DTBO_IMG=""
-              [ "${BUILD_DTBO}" = "1" ] || return 0
-              local dts_dir="${OUT_DIR}/arch/arm64/boot/dts" args=() e rel id f missing=0
-              for e in ${DTBO_ENTRIES}; do
-                  [ -f "${dts_dir}/${e%:*}" ] || missing=1
-              done
-              if [ "${missing}" = "1" ]; then
-                  log_info "Overlay .dtbo belum ada, menjalankan make dtbs..."
-                  make "${MAKE_ARGS[@]}" dtbs 2>&1 | tee -a "${LOG_FILE}"
-              fi
-              for e in ${DTBO_ENTRIES}; do
-                  rel="${e%:*}"; id="${e##*:}"; f="${dts_dir}/${rel}"
-                  [ -f "${f}" ] || {
-                      log_error "Overlay tidak ditemukan: ${f}"
-                      log_error "Cek DTBO_ENTRIES dan CONFIG_BUILD_ARM64_DTB_OVERLAY_IMAGE_NAMES di .config."
-                      exit 1
-                  }
-                  args+=("${f}:${id}")
-              done
-              python3 - "${KERNEL_DIR}/dtbo_new.img" "${args[@]}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
-          import struct, sys
-          out, ents = sys.argv[1], sys.argv[2:]
-          blobs = []
-          for e in ents:
-              p, _, i = e.rpartition(":")
-              blobs.append((open(p, "rb").read(), int(i, 0)))
-          HDR = ESZ = 32
-          n = len(blobs)
-          off = HDR + ESZ * n
-          table, data = b"", b""
-          for b, i in blobs:
-              table += struct.pack(">8I", len(b), off + len(data), i, 0, 0, 0, 0, 0)
-              data += b
-          img = struct.pack(">8I", 0xD7B7AB1E, off + len(data), HDR, ESZ, n, HDR, 2048, 0) + table + data
-          open(out, "wb").write(img)
-          print("[DTBO] %s: %d entry, %d byte" % (out, n, len(img)))
-          PY
-              [ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "Gagal menyusun dtbo.img."; exit 1; }
-              DTBO_IMG="${KERNEL_DIR}/dtbo_new.img"
-              log_success "dtbo.img: ${DTBO_IMG}"
-          }
-
-          # DTS hasil decompile + .config, untuk dibandingkan dengan dtbo ROM (diunggah sebagai artifact)
-          dump_dts_debug() {
-              local dbg="${KERNEL_DIR}/debug" dts_dir="${OUT_DIR}/arch/arm64/boot/dts" f
-              mkdir -p "${dbg}"
-              cp -f "${OUT_DIR}/.config" "${dbg}/config.txt" 2>/dev/null
-              command -v dtc >/dev/null 2>&1 || { log_warn "dtc tidak ada, DTS tidak di-dump."; return 0; }
-              for f in "${dts_dir}/mediatek/mt6785.dtb" "${dts_dir}"/mediatek/oppo6785_*.dtbo; do
-                  [ -f "${f}" ] || continue
-                  dtc -I dtb -O dts -o "${dbg}/$(basename "${f}").dts" "${f}" 2>/dev/null
-              done
-              if [ -f "${dbg}/mt6785.dtb.dts" ] && ! grep -q '__symbols__' "${dbg}/mt6785.dtb.dts"; then
-                  log_warn "Base DTB tidak punya __symbols__: overlay bisa gagal menempel."
-              fi
-              return 0
           }
 
           # Menulis anykernel.sh khusus RM6785 (boot only, tanpa contoh ramdisk "tuna" bawaan upstream)
@@ -1035,22 +1156,7 @@ jobs:
               cp -a "${ANYKERNEL_DIR}/." "${work}/"
               rm -rf "${work}/.git"
               cp -f "${KERNEL_IMG}" "${work}/"
-              # DTB utama sudah ter-append di Image.gz-dtb. dtbo dari build ini ikut di zip (diflash ke partisi dtbo).
-              if [ -n "${DTBO_IMG:-}" ] && [ -f "${DTBO_IMG}" ]; then
-                  cp -f "${DTBO_IMG}" "${work}/dtbo.img"
-                  log_info "dtbo.img dari build ini ikut di zip (diflash otomatis oleh AnyKernel write_boot)."
-              else
-                  log_info "dtbo tidak ikut di zip (BUILD_DTBO=0): dtbo bawaan ROM dipakai."
-              fi
-              if [ "${NEKO_REPLACE_DTB}" = "1" ]; then
-                  base_dtb="${OUT_DIR}/arch/arm64/boot/dts/mediatek/mt6785.dtb"
-                  if [ -f "${base_dtb}" ]; then
-                      cp -f "${base_dtb}" "${work}/dtb"
-                      log_info "dtb (mt6785.dtb) ikut di zip: bagian DTB di boot.img akan diganti."
-                  else
-                      log_warn "mt6785.dtb tidak ditemukan, bagian DTB boot.img tidak diganti."
-                  fi
-              fi
+              # DTB sudah ter-append di Image.gz-dtb; dtbo memakai bawaan ROM (tidak diflash dari sini).
 
               write_anykernel_sh "${work}/anykernel.sh"
               patch_banner "${work}/META-INF/com/google/android/update-binary" || \
@@ -1087,15 +1193,16 @@ jobs:
                   get_clang
                   check_defconfig
                   patch_swappiness
+                  patch_vm_tuning
                   patch_dtb_append
                   patch_zram_compressor
+                  patch_zram_size
+                  patch_opp
                   setup_nomount
                   [ "${INCREMENTAL:-0}" = "1" ] || cleanup
                   mkdir -p "${OUT_DIR}"
                   setup_env
                   build_kernel
-                  build_dtbo_img
-                  dump_dts_debug
                   package_zip
                   ;;
           esac
@@ -1109,16 +1216,19 @@ jobs:
           KERNEL_BRANCH: ${{ inputs.kernel_branch }}
           KERNEL_REPO_TOKEN: ${{ inputs.private_repo_token || secrets.KERNEL_REPO_TOKEN }}
           NEMO_CONFIGS: ${{ inputs.defconfig }}
+          STABLE: ${{ inputs.stable_mode && '1' || '0' }}
+          VM_TUNE: ${{ inputs.vm_tune && '1' || '0' }}
           NOMOUNT: ${{ inputs.enable_nomount && '1' || '0' }}
           NOMOUNT_REF: ${{ inputs.nomount_ref }}
           LOCALVERSION: ${{ inputs.localversion }}
-          BUILD_DTBO: ${{ inputs.build_dtbo && '1' || '0' }}
-          NEKO_NO_LTO: ${{ inputs.disable_lto && '1' || '0' }}
-          NEKO_REPLACE_DTB: ${{ inputs.replace_dtb_section && '1' || '0' }}
           SWAPPINESS_PATCH: ${{ inputs.swappiness_default == 'off' && '0' || '1' }}
           SWAPPINESS_DEFAULT: ${{ inputs.swappiness_default == 'off' && '100' || inputs.swappiness_default }}
           SWAPPINESS_LOCK: ${{ inputs.swappiness_lock && '1' || '0' }}
           LOWRAM: ${{ inputs.lowram_mode == 'off' && '0' || '1' }}
+          LOWRAM_AGGRESSIVE: ${{ inputs.aggressive_debug_off && '1' || '0' }}
+          ZRAM_MIN_PERCENT: ${{ inputs.zram_size_percent }}
+          GPU_MAX_KHZ: ${{ inputs.gpu_max_khz }}
+          CPU_BIG_MAX_KHZ: ${{ inputs.cpu_big_max_khz }}
           ZRAM_COMP: ${{ inputs.lowram_mode == 'off' && 'lz4' || inputs.lowram_mode }}
           CLANG_TYPE: ${{ inputs.clang_toolchain }}
           GF_CLANG_VERSION: ${{ inputs.clang_version }}
@@ -1128,17 +1238,6 @@ jobs:
           cd "$HOME/work"
           if [ -n "$KERNEL_REPO_TOKEN" ]; then echo "::add-mask::$KERNEL_REPO_TOKEN"; fi
           bash build.sh 2>&1 | tee "$HOME/work/ci-build.log"
-
-      - name: Statistik ccache
-        if: always()
-        run: ccache -s || true
-
-      - name: Simpan cache ccache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.ccache
-          key: ccache-nemo-${{ github.run_id }}
 
       - name: Cari ZIP hasil build
         env:
@@ -1155,7 +1254,10 @@ jobs:
           rel="$(cat "$src/out/include/config/kernel.release" 2>/dev/null || echo '?')"
           clang_bin="$(find "$HOME/work" -maxdepth 3 -path '*/bin/clang' \( -type f -o -type l \) 2>/dev/null | head -n1)"
           clang_ver="N/A"
+          clang_tag=""
           if [ -n "$clang_bin" ]; then
+            tagf="$(dirname "$(dirname "$clang_bin")")/.gf_tag"
+            [ -f "$tagf" ] && clang_tag="$(cat "$tagf")"
             clang_ver="$("$clang_bin" --version | head -n1 | sed -n 's/.*clang version \([0-9.]*\).*/\1/p')"
             [ -n "$clang_ver" ] || clang_ver="unknown"
           fi
@@ -1166,6 +1268,8 @@ jobs:
             echo "ZIP_PATH=$zip"
             echo "KERNEL_RELEASE=$rel"
             echo "CLANG_INFO=$clang_ver"
+            echo "CLANG_TAG=$clang_tag"
+            echo "NOMOUNT_COMMIT=$(git -C "$src/NoMount" rev-parse --short HEAD 2>/dev/null || echo '-')"
             echo "BUILD_DURATION=$(( $(date +%s) - START_TS ))"
             echo "COMMIT_MSG=$(git -C "$src" log -1 --pretty=format:'%s' 2>/dev/null || echo '-')"
             echo "COMMIT_URL=${base}/commit/${full}"
@@ -1181,17 +1285,6 @@ jobs:
           path: ${{ env.ZIP_PATH }}
           retention-days: 14
           if-no-files-found: error
-
-      - name: Upload dtbo dan DTS debug
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dtbo-debug-${{ github.run_number }}
-          path: |
-            ~/work/android_kernel_realme_nemo/dtbo_new.img
-            ~/work/android_kernel_realme_nemo/debug/
-          retention-days: 14
-          if-no-files-found: ignore
 
       - name: Upload log build
         if: always()
@@ -1210,11 +1303,14 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CUSTOM_NOTE: ${{ inputs.custom_note }}
-          NOMOUNT_ON: ${{ inputs.enable_nomount && 'NoMount' || 'Normal' }}
+          NOMOUNT_ON: ${{ inputs.stable_mode && 'Stable' || (inputs.enable_nomount && 'NoMount' || 'Normal') }}
           NOMOUNT_REF_IN: ${{ inputs.nomount_ref }}
           SWAP_IN: ${{ inputs.swappiness_default }}
           SWAP_LOCK: ${{ inputs.swappiness_lock && 'locked' || 'unlocked' }}
           LOWRAM_IN: ${{ inputs.lowram_mode }}
+          ZRAM_PCT_IN: ${{ inputs.stable_mode && '0' || inputs.zram_size_percent }}
+          GPU_OC_IN: ${{ inputs.stable_mode && '0' || inputs.gpu_max_khz }}
+          CPU_OC_IN: ${{ inputs.stable_mode && '0' || inputs.cpu_big_max_khz }}
           CLANG_NAME: ${{ inputs.clang_toolchain }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
@@ -1225,9 +1321,14 @@ jobs:
 
           zipfile="$(basename "$ZIP_PATH")"
           variant="$NOMOUNT_ON"
-          [ "$NOMOUNT_ON" = "NoMount" ] && variant="NoMount (${NOMOUNT_REF_IN})"
+          [ "$NOMOUNT_ON" = "NoMount" ] && variant="NoMount (${NOMOUNT_REF_IN} @ ${NOMOUNT_COMMIT:--})"
           swap="off"
           [ "$SWAP_IN" != "off" ] && swap="${SWAP_IN} (${SWAP_LOCK})"
+          zr="$LOWRAM_IN"
+          [ "${ZRAM_PCT_IN:-0}" != "0" ] && zr="${LOWRAM_IN}, min ${ZRAM_PCT_IN}% RAM"
+          oc=""
+          [ "${GPU_OC_IN:-0}" != "0" ] && oc="GPU ${GPU_OC_IN} kHz"
+          [ "${CPU_OC_IN:-0}" != "0" ] && oc="${oc:+$oc, }CPU A76 ${CPU_OC_IN} kHz"
           cap="$(mktemp)"
           {
             printf '✅ *Build Successful* ✅\n\n'
@@ -1238,8 +1339,9 @@ jobs:
             printf '*Build Variant:* %s\n' "$(esc "$variant")"
             printf '*Kernel:* %s\n' "$(esc "$KERNEL_RELEASE")"
             printf '*Swappiness:* %s\n' "$(esc "$swap")"
-            printf '*Zram:* %s\n' "$(esc "$LOWRAM_IN")"
-            printf '*Clang:* %s\n' "$(esc "${CLANG_NAME^} $CLANG_INFO")"
+            printf '*Zram:* %s\n' "$(esc "$zr")"
+            if [ -n "$oc" ]; then printf '*Max freq:* %s\n' "$(esc "$oc")"; fi
+            printf '*Clang:* %s\n' "$(esc "${CLANG_NAME^} $CLANG_INFO${CLANG_TAG:+ (tag $CLANG_TAG)}")"
             if [ -n "$CUSTOM_NOTE" ]; then printf '\n*Note:* %s\n' "$(esc "$CUSTOM_NOTE")"; fi
             printf '\n[View Run](%s)\n' "$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
           } > "$cap"
@@ -1262,7 +1364,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CUSTOM_NOTE: ${{ inputs.custom_note }}
           IN_BRANCH: ${{ inputs.kernel_branch }}
-          NOMOUNT_ON: ${{ inputs.enable_nomount && 'NoMount' || 'Normal' }}
+          NOMOUNT_ON: ${{ inputs.stable_mode && 'Stable' || (inputs.enable_nomount && 'NoMount' || 'Normal') }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
           esc() { printf '%s' "$1" | sed 's/[]\_*[()~`>#+=|{}.!-]/\\&/g'; }
