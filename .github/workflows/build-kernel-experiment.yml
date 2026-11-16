@@ -83,10 +83,27 @@ on:
         type: string
         default: '821000'
       cpu_big_max_khz:
-        description: 'EKSPERIMENTAL: CPU A76 (cluster besar, G90T) frekuensi tertinggi dalam kHz, 2050000-2100000. Voltase TIDAK dinaikkan (sudah di batas 1.11875 V). 0 = tidak diubah (stock 2050000)'
+        description: 'CPU A76 (cluster besar, G90T) frekuensi tertinggi. Stock = 2050 MHz. Pilih turun jika reboot acak/freeze'
         required: true
-        type: string
-        default: '0'
+        type: choice
+        options:
+          - '0 (stock 2050 MHz)'
+          - '2060000 (2060 MHz)'
+          - '2075000 (2075 MHz)'
+          - '2090000 (2090 MHz)'
+          - '2100000 (2100 MHz)'
+        default: '2100000 (2100 MHz)'
+      cpu_big_volt_steps:
+        description: 'Tambahan voltase OPP tertinggi A76 (1 langkah = 6,25 mV, stock 1.11875 V). Batas voltase driver ikut diangkat otomatis. Naikkan bertahap jika OC belum stabil; lebih tinggi = lebih panas'
+        required: true
+        type: choice
+        options:
+          - '0 (stock 1.11875 V)'
+          - '1 (+6.25 mV = 1.12500 V)'
+          - '2 (+12.5 mV = 1.13125 V)'
+          - '3 (+18.75 mV = 1.13750 V)'
+          - '4 (+25 mV = 1.14375 V)'
+        default: '2 (+12.5 mV = 1.13125 V)'
       aggressive_debug_off:
         description: 'Mode hemat RAM juga mematikan SCHEDSTATS & KPROBES (sedikit lebih ringan, tapi lebih berisiko bootloop). Default OFF'
         required: true
@@ -237,7 +254,9 @@ jobs:
           ZRAM_MIN_PERCENT="${ZRAM_MIN_PERCENT:-0}"
           # Frekuensi tertinggi GPU / CPU besar (kHz, 0 = tidak diubah). Lihat patch_opp.
           GPU_MAX_KHZ="${GPU_MAX_KHZ:-0}"
-          CPU_BIG_MAX_KHZ="${CPU_BIG_MAX_KHZ:-0}"
+          CPU_BIG_MAX_KHZ="${CPU_BIG_MAX_KHZ:-0}"; CPU_BIG_MAX_KHZ="${CPU_BIG_MAX_KHZ%% *}"
+          # Tambahan voltase OPP tertinggi A76 dalam langkah PMIC 6,25 mV (0-4). Pilihan dropdown "2 (+12.5 mV ...)" -> 2.
+          CPU_BIG_VOLT_STEPS="${CPU_BIG_VOLT_STEPS:-0}"; CPU_BIG_VOLT_STEPS="${CPU_BIG_VOLT_STEPS%% *}"
 
           # --- Swappiness ---------------------------------------------------------------
           # 1 = patch source: batas swappiness 100 -> 200 (sysctl & memcg), default diatur di bawah
@@ -273,6 +292,7 @@ jobs:
               ZRAM_MIN_PERCENT=0
               GPU_MAX_KHZ=0
               CPU_BIG_MAX_KHZ=0
+              CPU_BIG_VOLT_STEPS=0
           fi
 
           if [ -f "${PWD}/Makefile" ] && [ -d "${PWD}/arch/arm64" ]; then
@@ -861,18 +881,20 @@ jobs:
               [ "${PIPESTATUS[0]}" -eq 0 ] || log_warn "Patch ukuran zram dilewati (lihat pesan di atas)."
           }
 
-          # Frekuensi tertinggi GPU/CPU lewat tabel OPP driver MediaTek (mt6785). Lokasi file dicari dari
-          # nama simbol; semua salinan mt6785 di repo ditambal. Tidak ada yang berhasil -> build dihentikan.
+          # Frekuensi tertinggi GPU/CPU dan voltase OPP tertinggi A76 lewat tabel OPP driver MediaTek (mt6785).
+          # Lokasi file dicari dari nama simbol; semua salinan mt6785 di repo ditambal.
+          # Tidak ada yang berhasil / nilai tidak valid -> build dihentikan.
           patch_opp() {
-              [ "${GPU_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_MAX_KHZ}" = "0" ] && return 0
+              [ "${GPU_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_VOLT_STEPS}" = "0" ] && return 0
               local v
-              for v in "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}"; do
-                  [[ "${v}" =~ ^[0-9]+$ ]] || { log_error "GPU_MAX_KHZ/CPU_BIG_MAX_KHZ harus angka kHz (sekarang: '${v}')"; exit 1; }
+              for v in "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" "${CPU_BIG_VOLT_STEPS}"; do
+                  [[ "${v}" =~ ^[0-9]+$ ]] || { log_error "GPU_MAX_KHZ/CPU_BIG_MAX_KHZ/CPU_BIG_VOLT_STEPS harus angka (sekarang: '${v}')"; exit 1; }
               done
-              log_info "Patch OPP: GPU max=${GPU_MAX_KHZ} kHz, CPU A76 max=${CPU_BIG_MAX_KHZ} kHz (0 = tidak diubah)"
-              python3 - "${KERNEL_DIR}" "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
+              log_info "Patch OPP: GPU max=${GPU_MAX_KHZ} kHz, CPU A76 max=${CPU_BIG_MAX_KHZ} kHz, voltase +${CPU_BIG_VOLT_STEPS} langkah x 6,25 mV (0 = tidak diubah)"
+              python3 - "${KERNEL_DIR}" "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" "${CPU_BIG_VOLT_STEPS}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
           import os, re, subprocess, sys
-          root, gpu_khz, cpu_khz = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          root = sys.argv[1]
+          gpu_khz, cpu_khz, steps = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
           failed = False
 
           def err(msg):
@@ -890,6 +912,12 @@ jobs:
               r = subprocess.run(["grep", "-rlE", "--include=" + glob, pattern, root + "/drivers"],
                                  capture_output=True, text=True)
               return sorted(r.stdout.split())
+
+          def put(s, edits):
+              # edits: [(match, group, new_value)] -> ganti dari belakang agar indeks tetap valid
+              for m, g, v in sorted(edits, key=lambda e: e[0].start(e[1]), reverse=True):
+                  s = s[:m.start(g)] + str(v) + s[m.end(g):]
+              return s
 
           # Repo bisa punya beberapa salinan driver (mis. drivers/gpu/... dan drivers/misc/...).
           # Semua salinan mt6785 ditambal; mana yang dikompilasi tidak perlu ditebak.
@@ -926,35 +954,63 @@ jobs:
               if done == 0 and not failed:
                   err("tidak ada salinan driver GPU yang berhasil ditambal")
 
-          # ---- CPU: A76 (cluster "L") segmen 6785T, OPP0. Frekuensi saja; voltase TIDAK diubah ----
-          if cpu_khz:
-              if cpu_khz % 1000 or not 2050000 <= cpu_khz <= 2100000:
+          # ---- CPU A76 (cluster "L", segmen 6785T), OPP0: frekuensi dan/atau voltase ----
+          # Voltase: 1 langkah = 6,25 mV (625 dalam satuan 10uV). Stock OPP0 = 111875 (1,11875 V) = kode PMIC 115.
+          # Batas MAX_VPROC_VOLT / MAX_VSRAM_VOLT (stock 112000) ikut diangkat, kalau tidak kenaikan di-clamp.
+          if cpu_khz or steps:
+              ok = True
+              if cpu_khz and (cpu_khz % 1000 or not 2050000 <= cpu_khz <= 2100000):
                   err(f"CPU_BIG_MAX_KHZ={cpu_khz}: harus kelipatan 1000 dan di antara 2050000-2100000")
-              else:
-                  mhz = cpu_khz // 1000
-                  n_opp = n_pv = 0
+                  ok = False
+              if not 0 <= steps <= 4:
+                  err(f"CPU_BIG_VOLT_STEPS={steps}: harus 0-4 (maks +25 mV)")
+                  ok = False
+              if ok:
+                  target_khz = cpu_khz or 2050000
+                  mhz = target_khz // 1000
+                  volt = 111875 + 625 * steps
+                  code = 115 + steps
+                  vmax = 112000 + 625 * steps
+                  n_opp = n_pv = n_plat = 0
+
                   for o in find(r"CPU_DVFS_FREQ0_L_6785T\b", "*.h"):
                       s = open(o).read()
-                      m = re.search(r"(#define\s+CPU_DVFS_FREQ0_L_6785T\s+)(\d+)", s)
-                      if not m or int(m.group(2)) not in (2050000, cpu_khz):
-                          warn(f"{rel(o)}: CPU_DVFS_FREQ0_L_6785T bernilai tak terduga, dilewati")
+                      mf = re.search(r"(#define\s+CPU_DVFS_FREQ0_L_6785T\s+)(\d+)", s)
+                      mv = re.search(r"(#define\s+CPU_DVFS_VOLT0_VPROC2_6785T\s+)(\d+)", s)
+                      if (not mf or not mv or not 2050000 <= int(mf.group(2)) <= 2100000
+                              or (int(mv.group(2)) - 111875) % 625 or not 0 <= (int(mv.group(2)) - 111875) // 625 <= 4):
+                          warn(f"{rel(o)}: OPP0 A76 6785T bernilai tak terduga, dilewati")
                           continue
-                      open(o, "w").write(s[:m.start(2)] + str(cpu_khz) + s[m.end(2):])
-                      print(f"[PATCH] {rel(o)}: CPU_DVFS_FREQ0_L_6785T = {cpu_khz} kHz")
+                      open(o, "w").write(put(s, [(mf, 2, target_khz), (mv, 2, volt)]))
+                      print(f"[PATCH] {rel(o)}: A76 OPP0 = {target_khz} kHz @ {volt/100000:.5f} V")
                       n_opp += 1
+
                   for p in find(r"FY_6785TTbl\b", "*.h"):
                       t = open(p).read()
                       blk = re.search(r"static unsigned int FY_6785TTbl\[.*?\n\};", t, re.S)
-                      row = re.search(r"(/\* L \*/\s*\n\s*\{\s*)(\d+)(,\s*115,\s*1,\s*1\s*\})", blk.group(0)) if blk else None
-                      if not row or int(row.group(2)) not in (2050, mhz):
+                      row = re.search(r"(/\* L \*/\s*\n\s*\{\s*)(\d+)(,\s*)(\d+)(,\s*1,\s*1\s*\})", blk.group(0)) if blk else None
+                      if not row or not 2050 <= int(row.group(2)) <= 2100 or not 115 <= int(row.group(4)) <= 119:
                           warn(f"{rel(p)}: baris OPP0 cluster L di FY_6785TTbl tidak cocok, dilewati")
                           continue
-                      nb = blk.group(0)[:row.start(2)] + str(mhz) + blk.group(0)[row.end(2):]
+                      nb = put(blk.group(0), [(row, 2, mhz), (row, 4, code)])
                       open(p, "w").write(t[:blk.start()] + nb + t[blk.end():])
-                      print(f"[PATCH] {rel(p)}: OPP0 cluster L (6785T) = {mhz} MHz; voltase tetap 1.11875 V")
+                      print(f"[PATCH] {rel(p)}: OPP0 cluster L (6785T) = {mhz} MHz, kode voltase {code}")
                       n_pv += 1
-                  if n_opp == 0 or n_pv == 0:
-                      err(f"tabel CPU belum lengkap ditambal (tabel OPP: {n_opp}, tabel PV: {n_pv}); keduanya harus >= 1")
+
+                  if steps:
+                      for f in find(r"mediatek,mt6785-dvfsp", "*.h"):
+                          s = open(f).read()
+                          mp = re.search(r"(#define\s+MAX_VPROC_VOLT\s+)(\d+)", s)
+                          ms = re.search(r"(#define\s+MAX_VSRAM_VOLT\s+)(\d+)", s)
+                          if not mp or not ms or not all(112000 <= int(x.group(2)) <= 112000 + 625 * 4 for x in (mp, ms)):
+                              warn(f"{rel(f)}: MAX_VPROC_VOLT/MAX_VSRAM_VOLT tak terduga, dilewati")
+                              continue
+                          open(f, "w").write(put(s, [(mp, 2, vmax), (ms, 2, vmax)]))
+                          print(f"[PATCH] {rel(f)}: MAX_VPROC_VOLT = MAX_VSRAM_VOLT = {vmax}")
+                          n_plat += 1
+
+                  if n_opp == 0 or n_pv == 0 or (steps and n_plat == 0):
+                      err(f"tabel CPU belum lengkap ditambal (tabel OPP: {n_opp}, tabel PV: {n_pv}, batas voltase: {n_plat})")
 
           sys.exit(1 if failed else 0)
           PY
@@ -1241,6 +1297,7 @@ jobs:
           ZRAM_MIN_PERCENT: ${{ inputs.zram_size_percent }}
           GPU_MAX_KHZ: ${{ inputs.gpu_max_khz }}
           CPU_BIG_MAX_KHZ: ${{ inputs.cpu_big_max_khz }}
+          CPU_BIG_VOLT_STEPS: ${{ inputs.cpu_big_volt_steps }}
           ZRAM_COMP: ${{ inputs.lowram_mode == 'off' && 'lz4' || inputs.lowram_mode }}
           CLANG_TYPE: ${{ inputs.clang_toolchain }}
           GF_CLANG_VERSION: ${{ inputs.clang_version }}
@@ -1323,6 +1380,7 @@ jobs:
           ZRAM_PCT_IN: ${{ inputs.stable_mode && '0' || inputs.zram_size_percent }}
           GPU_OC_IN: ${{ inputs.stable_mode && '0' || inputs.gpu_max_khz }}
           CPU_OC_IN: ${{ inputs.stable_mode && '0' || inputs.cpu_big_max_khz }}
+          CPU_V_IN: ${{ inputs.stable_mode && '0' || inputs.cpu_big_volt_steps }}
           CLANG_NAME: ${{ inputs.clang_toolchain }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
@@ -1339,8 +1397,11 @@ jobs:
           zr="$LOWRAM_IN"
           [ "${ZRAM_PCT_IN:-0}" != "0" ] && zr="${LOWRAM_IN}, min ${ZRAM_PCT_IN}% RAM"
           oc=""
-          [ "${GPU_OC_IN:-0}" != "0" ] && oc="GPU ${GPU_OC_IN} kHz"
-          [ "${CPU_OC_IN:-0}" != "0" ] && oc="${oc:+$oc, }CPU A76 ${CPU_OC_IN} kHz"
+          gpu_oc="${GPU_OC_IN%% *}"
+          [ "${gpu_oc:-0}" != "0" ] && oc="GPU ${gpu_oc} kHz"
+          cpu_oc="${CPU_OC_IN%% *}"; cpu_v="${CPU_V_IN%% *}"
+          [ "${cpu_oc:-0}" != "0" ] && oc="${oc:+$oc, }CPU A76 ${cpu_oc} kHz"
+          [ "${cpu_v:-0}" != "0" ] && oc="${oc:+$oc, }volt A76 +$(awk "BEGIN{print ${cpu_v}*6.25}") mV"
           cap="$(mktemp)"
           {
             printf '✅ *Build Successful* ✅\n\n'
