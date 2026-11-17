@@ -89,12 +89,19 @@ on:
         options:
           - 'greenforce'
           - 'neutron'
+          - 'weebx'
+          - 'zyc'
         default: 'greenforce'
       clang_version:
-        description: 'Greenforce Clang: latest | angka major (mis. 19) | tag rilis. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
+        description: 'Greenforce / ZyC: latest | angka major (mis. 19) | tag rilis. WeebX: latest | nama branch/tag repo. Neutron: diabaikan. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
         required: false
         type: string
         default: 'latest'
+      list_tags:
+        description: 'Hanya tampilkan daftar tag/branch toolchain yang dipilih (tanpa build). Lihat hasilnya di log, lalu jalankan lagi dan isi clang_version dengan tag-nya'
+        required: false
+        type: boolean
+        default: false
       zip_name:
         description: 'Awalan nama ZIP'
         required: false
@@ -110,7 +117,36 @@ permissions:
   contents: read
 
 jobs:
+  list-tags:
+    if: ${{ inputs.list_tags }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Daftar tag toolchain
+        env:
+          TC: ${{ inputs.clang_toolchain }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$TC" in
+            greenforce) repo="greenforce-project/greenforce_clang" ;;
+            zyc)        repo="ZyCromerZ/Clang" ;;
+            weebx)
+              echo "WeebX Clang - branch & tag (isi salah satunya di clang_version):"
+              git ls-remote --tags --heads https://github.com/XSans0/WeebX-Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' \
+                | sed -e 's#^refs/heads/#  branch: #' -e 's#^refs/tags/#  tag:    #'
+              exit 0 ;;
+            *)
+              echo "Neutron selalu memakai versi terbaru (antman), tidak ada pilihan tag."
+              exit 0 ;;
+          esac
+          echo "${TC} - tag rilis terbaru (isi di clang_version, atau angka major):"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${repo}/releases?per_page=50" \
+            | jq -r '.[] | select(.draft|not) | "  " + .tag_name'
+
   build:
+    if: ${{ !inputs.list_tags }}
     runs-on: ubuntu-latest
     timeout-minutes: 340
     env:
@@ -267,13 +303,14 @@ jobs:
           fi
 
           OUT_DIR="${KERNEL_DIR}/out"
-          # Pilihan toolchain: greenforce (default) | neutron
+          # Pilihan toolchain: greenforce (default) | neutron | weebx | zyc
           #   CLANG_TYPE=neutron ./build.sh
-          # Versi Greenforce Clang (hanya untuk CLANG_TYPE=greenforce):
+          # Versi Greenforce / ZyC Clang (untuk CLANG_TYPE=greenforce atau zyc):
           #   GF_CLANG_VERSION=latest     -> rilis terbaru (default)
           #   GF_CLANG_VERSION=17         -> rilis terbaru dari clang 17 (angka major)
           #   GF_CLANG_VERSION=20261031   -> tag rilis tertentu
           #   Daftar yang tersedia: ./build.sh clang-list
+          # WeebX Clang: GF_CLANG_VERSION=latest -> branch default repo, atau isi nama branch/tag.
           # Tanpa env di atas, saat dijalankan di terminal akan muncul MENU pilihan toolchain.
           CLANG_TYPE_SET="${CLANG_TYPE:-}"
           GF_CLANG_VERSION_SET="${GF_CLANG_VERSION:-}"
@@ -341,10 +378,10 @@ jobs:
 
           # Output: <tag> TAB <clang major> TAB <url asset>, rilis terbaru di baris pertama
           gf_list() {
-              local page out auth=()
+              local api="${1:-${GF_API}}" page out auth=()
               [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
               for page in 1 2 3; do
-                  out=$(curl -fsSL "${auth[@]}" "${GF_API}?per_page=100&page=${page}" | python3 -c '
+                  out=$(curl -fsSL "${auth[@]}" "${api}?per_page=100&page=${page}" | python3 -c '
           import sys, json, re
           for r in json.load(sys.stdin):
               if r.get("draft"):
@@ -353,7 +390,7 @@ jobs:
                   n = a["name"]
                   if not n.endswith((".tar.gz", ".tar.zst", ".tar.xz")):
                       continue
-                  m = re.search(r"clang-(\d+)\.\d+\.\d+", n)
+                  m = re.search(r"clang-(\d+)\.\d+\.\d+", n, re.I)
                   print(r["tag_name"], m.group(1) if m else "?", a["browser_download_url"], sep="\t")
                   break
           ') || break
@@ -425,6 +462,82 @@ jobs:
               rm -rf "${tmp}"
           }
 
+          # ZyCromerZ Clang (https://github.com/ZyCromerZ/Clang) - biner ada di GitHub Releases
+          ZYC_API="https://api.github.com/repos/ZyCromerZ/Clang/releases"
+
+          download_zyc() {
+              local list line
+              list=$(gf_list "${ZYC_API}")
+              if [ -z "${list}" ]; then
+                  log_error "Gagal mengambil daftar rilis ZyC Clang (jaringan / rate limit GitHub? set GITHUB_TOKEN)."
+                  return 1
+              fi
+              case "${GF_CLANG_VERSION}" in
+                  latest)           line=$(head -n1 <<<"${list}") ;;
+                  [0-9]|[0-9][0-9]) line=$(awk -F'\t' -v v="${GF_CLANG_VERSION}" '$2==v{print; exit}' <<<"${list}") ;;
+                  *)                line=$(awk -F'\t' -v v="${GF_CLANG_VERSION}" '$1==v{print; exit}' <<<"${list}") ;;
+              esac
+              if [ -z "${line}" ]; then
+                  log_error "Versi ZyC '${GF_CLANG_VERSION}' tidak ditemukan. Versi major yang ada:"
+                  awk -F'\t' '!seen[$2]++{printf "    clang %s\n",$2}' <<<"${list}"
+                  return 1
+              fi
+              local ztag zmajor zurl
+              IFS=$'\t' read -r ztag zmajor zurl <<<"${line}"
+              log_info "ZyC Clang ${zmajor} (tag ${ztag})"
+              log_info "Mengunduh: ${zurl}"
+              local tmp; tmp=$(mktemp -d)
+              wget -q --show-progress -O "${tmp}/clang.tar" "${zurl}" || { rm -rf "${tmp}"; return 1; }
+              mkdir -p "${tmp}/x"
+              tar -xf "${tmp}/clang.tar" -C "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal ekstrak arsip ZyC Clang."; return 1; }
+              local bin; bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
+              if [ -z "${bin}" ]; then
+                  log_error "bin/clang tidak ada di arsip ZyC. Isi arsip (level atas):"
+                  ls -la "${tmp}/x" | sed 's/^/    /'
+                  rm -rf "${tmp}"
+                  return 1
+              fi
+              rm -rf "${CLANG_DIR}"
+              mkdir -p "$(dirname "${CLANG_DIR}")"
+              mv "$(dirname "$(dirname "${bin}")")" "${CLANG_DIR}"
+              echo "${ztag}" > "${CLANG_DIR}/.gf_tag"
+              rm -rf "${tmp}"
+          }
+
+          # WeebX Clang (https://github.com/XSans0/WeebX-Clang) - biner ada di dalam repo git
+          WEEBX_REPO="https://github.com/XSans0/WeebX-Clang.git"
+
+          download_weebx() {
+              local ref=""
+              case "${GF_CLANG_VERSION}" in
+                  latest|[0-9]|[0-9][0-9]) ref="" ;;
+                  *) ref="${GF_CLANG_VERSION}" ;;
+              esac
+              log_info "WeebX Clang (${ref:-branch default})"
+              if [ -n "${ref}" ] && ! git ls-remote --exit-code --heads --tags "${WEEBX_REPO}" "${ref}" >/dev/null 2>&1; then
+                  log_error "Branch/tag WeebX '${ref}' tidak ditemukan. Yang tersedia:"
+                  git ls-remote --tags --heads "${WEEBX_REPO}" | awk '{print $2}' | grep -v '\^{}$' \
+                      | sed -e 's#^refs/heads/#    branch: #' -e 's#^refs/tags/#    tag:    #'
+                  return 1
+              fi
+              local tmp; tmp=$(mktemp -d)
+              git clone --depth=1 ${ref:+-b "${ref}"} "${WEEBX_REPO}" "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal clone ${WEEBX_REPO}"; return 1; }
+              local commit; commit=$(git -C "${tmp}/x" rev-parse --short HEAD 2>/dev/null || echo "-")
+              rm -rf "${tmp}/x/.git"
+              local bin; bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
+              if [ -z "${bin}" ]; then
+                  log_error "bin/clang tidak ada di repo WeebX. Isi repo (level atas):"
+                  ls -la "${tmp}/x" | sed 's/^/    /'
+                  rm -rf "${tmp}"
+                  return 1
+              fi
+              rm -rf "${CLANG_DIR}"
+              mkdir -p "$(dirname "${CLANG_DIR}")"
+              mv "$(dirname "$(dirname "${bin}")")" "${CLANG_DIR}"
+              echo "${commit}" > "${CLANG_DIR}/.gf_tag"
+              rm -rf "${tmp}"
+          }
+
           download_neutron() {
               mkdir -p "${CLANG_DIR}" && pushd "${CLANG_DIR}" >/dev/null || return 1
               bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S=latest
@@ -438,6 +551,8 @@ jobs:
                   CLANG_DIR="${CLANG_DIR_USER}"
               elif [ "${CLANG_TYPE}" = "greenforce" ]; then
                   CLANG_DIR="${KERNEL_DIR}/../clang-greenforce-${GF_CLANG_VERSION}"
+              elif [ "${CLANG_TYPE}" = "zyc" ] || [ "${CLANG_TYPE}" = "weebx" ]; then
+                  CLANG_DIR="${KERNEL_DIR}/../clang-${CLANG_TYPE}-${GF_CLANG_VERSION//\//_}"
               else
                   CLANG_DIR="${KERNEL_DIR}/../clang-${CLANG_TYPE}"
               fi
@@ -465,6 +580,8 @@ jobs:
                   log_warn "Daftar Greenforce Clang tidak bisa diambil, hanya Neutron yang ditawarkan."
               fi
               labels+=("Neutron Clang (Antman, terbaru)"); types+=(neutron); vers+=(latest)
+              labels+=("WeebX Clang (branch default)"); types+=(weebx); vers+=(latest)
+              labels+=("ZyC Clang (rilis terbaru)"); types+=(zyc); vers+=(latest)
 
               echo "Pilih toolchain:"
               local i
@@ -482,13 +599,15 @@ jobs:
               choose_clang
               resolve_clang_dir
               # CLANG_REFRESH=1 -> unduh ulang (berguna untuk GF_CLANG_VERSION=latest)
-              [ "${CLANG_REFRESH:-0}" = "1" ] && [ "${CLANG_TYPE}" = "greenforce" ] && [ -z "${CLANG_DIR_USER}" ] && rm -rf "${CLANG_DIR}"
+              [ "${CLANG_REFRESH:-0}" = "1" ] && [ "${CLANG_TYPE}" != "neutron" ] && [ -z "${CLANG_DIR_USER}" ] && rm -rf "${CLANG_DIR}"
               if [ ! -x "${CLANG_DIR}/bin/clang" ]; then
                   log_warn "Clang (${CLANG_TYPE}) tidak ditemukan di ${CLANG_DIR}. Mengunduh..."
                   case "${CLANG_TYPE}" in
                       greenforce) download_greenforce ;;
                       neutron)    download_neutron ;;
-                      *) log_error "CLANG_TYPE tidak dikenal: ${CLANG_TYPE} (pilih: greenforce | neutron)"; exit 1 ;;
+                      weebx)      download_weebx ;;
+                      zyc)        download_zyc ;;
+                      *) log_error "CLANG_TYPE tidak dikenal: ${CLANG_TYPE} (pilih: greenforce | neutron | weebx | zyc)"; exit 1 ;;
                   esac || { log_error "Gagal menyiapkan clang. Taruh manual di: ${CLANG_DIR}"; exit 1; }
               fi
               [ -x "${CLANG_DIR}/bin/clang" ] || { log_error "clang masih tidak ditemukan di ${CLANG_DIR}/bin."; exit 1; }
@@ -1229,7 +1348,8 @@ jobs:
             printf '*Kernel:* %s\n' "$(esc "$KERNEL_RELEASE")"
             printf '*Swappiness:* %s\n' "$(esc "$swap")"
             printf '*Zram:* %s\n' "$(esc "$zr")"
-            printf '*Clang:* %s\n' "$(esc "${CLANG_NAME^} $CLANG_INFO${CLANG_TAG:+ (tag $CLANG_TAG)}")"
+            case "$CLANG_NAME" in weebx) cname="WeebX" ;; zyc) cname="ZyC" ;; *) cname="${CLANG_NAME^}" ;; esac
+            printf '*Clang:* %s\n' "$(esc "$cname $CLANG_INFO${CLANG_TAG:+ (tag $CLANG_TAG)}")"
             if [ -n "$CUSTOM_NOTE" ]; then printf '\n*Note:* %s\n' "$(esc "$CUSTOM_NOTE")"; fi
             printf '\n[View Run](%s)\n' "$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
           } > "$cap"
