@@ -93,7 +93,7 @@ on:
           - 'zyc'
         default: 'greenforce'
       clang_version:
-        description: 'Greenforce / ZyC: latest | angka major (mis. 19) | tag rilis. WeebX: latest | nama branch/tag repo. Neutron: diabaikan. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
+        description: 'Greenforce / ZyC: latest | angka major (mis. 19) | tag rilis. WeebX: latest | 16 | 17 | 18 | 19 | tag rilis (mis. WeebX-Clang-19.1.5-release). Neutron: diabaikan. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
         required: false
         type: string
         default: 'latest'
@@ -131,10 +131,14 @@ jobs:
             greenforce) repo="greenforce-project/greenforce_clang" ;;
             zyc)        repo="ZyCromerZ/Clang" ;;
             weebx)
-              echo "WeebX Clang - branch & tag (isi salah satunya di clang_version):"
-              git ls-remote --tags --heads https://github.com/XSans0/WeebX-Clang.git \
-                | awk '{print $2}' | grep -v '\^{}$' \
-                | sed -e 's#^refs/heads/#  branch: #' -e 's#^refs/tags/#  tag:    #'
+              echo "WeebX Clang - isi clang_version dengan: latest | 16 | 17 | 18 | 19 | salah satu tag di bawah"
+              echo "  latest = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/main/link.txt | awk -F/ '{print $(NF-1)}')"
+              for v in 16 17 18 19; do
+                echo "  $v = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/release/$v.x/link.txt | awk -F/ '{print $(NF-1)}')"
+              done
+              echo "Semua tag:"
+              git ls-remote --tags https://github.com/XSans0/WeebX-Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' | sed 's#^refs/tags/#  #'
               exit 0 ;;
             *)
               echo "Neutron selalu memakai versi terbaru (antman), tidak ada pilihan tag."
@@ -504,29 +508,40 @@ jobs:
               rm -rf "${tmp}"
           }
 
-          # WeebX Clang (https://github.com/XSans0/WeebX-Clang) - biner ada di dalam repo git
-          WEEBX_REPO="https://github.com/XSans0/WeebX-Clang.git"
+          # WeebX Clang (https://github.com/XSans0/WeebX-Clang)
+          # Repo hanya berisi link.txt; binarynya ada di GitHub Releases (tag WeebX-Clang-<versi>-release)
+          WEEBX_RAW="https://raw.githubusercontent.com/XSans0/WeebX-Clang/main"
+          WEEBX_REL="https://github.com/XSans0/WeebX-Clang/releases/download"
 
           download_weebx() {
-              local ref=""
+              local url="" tag=""
               case "${GF_CLANG_VERSION}" in
-                  latest|[0-9]|[0-9][0-9]) ref="" ;;
-                  *) ref="${GF_CLANG_VERSION}" ;;
+                  latest)
+                      url=$(curl -fsSL "${WEEBX_RAW}/main/link.txt" | tr -d '[:space:]') ;;
+                  [0-9]|[0-9][0-9])
+                      url=$(curl -fsSL "${WEEBX_RAW}/release/${GF_CLANG_VERSION}.x/link.txt" | tr -d '[:space:]') ;;
+                  *)
+                      tag="${GF_CLANG_VERSION}"
+                      url="${WEEBX_REL}/${tag}/${tag%-release}.tar.gz" ;;
               esac
-              log_info "WeebX Clang (${ref:-branch default})"
-              if [ -n "${ref}" ] && ! git ls-remote --exit-code --heads --tags "${WEEBX_REPO}" "${ref}" >/dev/null 2>&1; then
-                  log_error "Branch/tag WeebX '${ref}' tidak ditemukan. Yang tersedia:"
-                  git ls-remote --tags --heads "${WEEBX_REPO}" | awk '{print $2}' | grep -v '\^{}$' \
-                      | sed -e 's#^refs/heads/#    branch: #' -e 's#^refs/tags/#    tag:    #'
+              if [ -z "${url}" ]; then
+                  log_error "Versi WeebX '${GF_CLANG_VERSION}' tidak ditemukan. Pakai: latest | 16 | 17 | 18 | 19 | tag (mis. WeebX-Clang-19.1.5-release)."
                   return 1
               fi
+              tag=$(basename "$(dirname "${url}")")
+              log_info "WeebX Clang (tag ${tag})"
+              log_info "Mengunduh: ${url}"
               local tmp; tmp=$(mktemp -d)
-              git clone --depth=1 ${ref:+-b "${ref}"} "${WEEBX_REPO}" "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal clone ${WEEBX_REPO}"; return 1; }
-              local commit; commit=$(git -C "${tmp}/x" rev-parse --short HEAD 2>/dev/null || echo "-")
-              rm -rf "${tmp}/x/.git"
+              wget -q --show-progress -O "${tmp}/clang.tar" "${url}" || {
+                  rm -rf "${tmp}"
+                  log_error "Gagal mengunduh. Tag mungkin salah / asetnya sudah dihapus dari Releases."
+                  return 1
+              }
+              mkdir -p "${tmp}/x"
+              tar -xf "${tmp}/clang.tar" -C "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal ekstrak arsip WeebX Clang."; return 1; }
               local bin; bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
               if [ -z "${bin}" ]; then
-                  log_error "bin/clang tidak ada di repo WeebX. Isi repo (level atas):"
+                  log_error "bin/clang tidak ada di arsip WeebX. Isi arsip (level atas):"
                   ls -la "${tmp}/x" | sed 's/^/    /'
                   rm -rf "${tmp}"
                   return 1
@@ -534,7 +549,7 @@ jobs:
               rm -rf "${CLANG_DIR}"
               mkdir -p "$(dirname "${CLANG_DIR}")"
               mv "$(dirname "$(dirname "${bin}")")" "${CLANG_DIR}"
-              echo "${commit}" > "${CLANG_DIR}/.gf_tag"
+              echo "${tag}" > "${CLANG_DIR}/.gf_tag"
               rm -rf "${tmp}"
           }
 
@@ -580,7 +595,7 @@ jobs:
                   log_warn "Daftar Greenforce Clang tidak bisa diambil, hanya Neutron yang ditawarkan."
               fi
               labels+=("Neutron Clang (Antman, terbaru)"); types+=(neutron); vers+=(latest)
-              labels+=("WeebX Clang (branch default)"); types+=(weebx); vers+=(latest)
+              labels+=("WeebX Clang (terbaru)"); types+=(weebx); vers+=(latest)
               labels+=("ZyC Clang (rilis terbaru)"); types+=(zyc); vers+=(latest)
 
               echo "Pilih toolchain:"
