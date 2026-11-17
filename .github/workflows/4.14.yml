@@ -7,17 +7,12 @@ on:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/elohim-etz/android_kernel_realme_mt6785.git'
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785-nomount.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
         type: string
         default: 'main'
-      kernel_commit:
-        description: 'Commit SHA penuh (40 karakter) untuk di-fetch persis. Kosongkan untuk pakai kernel_branch seperti biasa'
-        required: false
-        type: string
-        default: 'bf2f0b665d20312d2f4a32f9e2942f6288ab4633'
       defconfig:
         description: 'Defconfig name (e.g. RM6785_defconfig)'
         required: true
@@ -177,62 +172,9 @@ jobs:
         env:
           INPUT_KERNEL_REPO:   ${{ github.event.inputs.kernel_repo }}
           INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
-          INPUT_KERNEL_COMMIT: ${{ github.event.inputs.kernel_commit }}
           INPUT_PRIVATE_TOKEN: ${{ github.event.inputs.private_repo_token }}
           INPUT_DEFCONFIG:     ${{ github.event.inputs.defconfig }}
-        run: |
-          set -euo pipefail
-          if [ -n "${INPUT_KERNEL_COMMIT:-}" ]; then
-            # Mode commit persis (fetch 1 commit, tanpa riwayat)
-            if ! [[ "$INPUT_KERNEL_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
-              echo "::error::kernel_commit harus SHA penuh 40 karakter hex"
-              exit 1
-            fi
-            url="$INPUT_KERNEL_REPO"
-            if [ -n "${INPUT_PRIVATE_TOKEN:-}" ]; then
-              echo "::add-mask::$INPUT_PRIVATE_TOKEN"
-              url="${url/https:\/\/github.com/https:\/\/x-access-token:${INPUT_PRIVATE_TOKEN}@github.com}"
-            fi
-            rm -rf kernel
-            git init -q kernel
-            cd kernel
-            git remote add origin "$url"
-            git fetch --depth=1 origin "$INPUT_KERNEL_COMMIT" \
-              || { echo "::error::fetch commit $INPUT_KERNEL_COMMIT gagal (SHA salah / commit tidak ada di repo itu)"; exit 1; }
-            git checkout -q FETCH_HEAD
-            got="$(git rev-parse HEAD)"
-            [ "${got,,}" = "${INPUT_KERNEL_COMMIT,,}" ] \
-              || { echo "::error::HEAD ($got) tidak sama dengan commit yang diminta"; exit 1; }
-            echo "Kernel source @ $got"
-            test -f "arch/arm64/configs/${INPUT_DEFCONFIG}" \
-              || { echo "::error::defconfig ${INPUT_DEFCONFIG} tidak ada di arch/arm64/configs"; exit 1; }
-          else
-            bash .github/scripts/clone_kernel.sh
-          fi
-
-      # ── Patch vcodec (enum_framesizes untuk format raw) ───────────────────
-      - name: Apply vcodec patch
-        if: github.event.inputs.apply_vcodec_patch == 'true'
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -euo pipefail
-          P="$GITHUB_WORKSPACE/patches/vcodec-enum-framesizes-raw.patch"
-          test -f "$P" || { echo "::error::$P tidak ada di repo workflow"; exit 1; }
-          mapfile -t files < <(find . -name mtk_vcodec_enc.c)
-          echo "mtk_vcodec_enc.c ditemukan: ${#files[@]}"
-          printf '  %s\n' "${files[@]}"
-          [ "${#files[@]}" -ge 1 ] || { echo "::error::mtk_vcodec_enc.c tidak ditemukan"; exit 1; }
-          for f in "${files[@]}"; do
-            d="$(dirname "$f")"
-            if grep -q "not in bitstream table" "$f"; then
-              echo "$f sudah dipatch, lewati"; continue
-            fi
-            (cd "$d" && patch -p1 --dry-run < "$P") \
-              || { echo "::error::patch TIDAK cocok dengan $f (versi file beda). Kirim diff-nya untuk dibuatkan patch baru"; exit 1; }
-            (cd "$d" && patch -p1 < "$P")
-          done
-          grep -rn "not in bitstream table" --include=mtk_vcodec_enc.c . \
-            || { echo "::error::patch tidak terdeteksi setelah diterapkan"; exit 1; }
+        run: bash .github/scripts/clone_kernel.sh
 
       # ── NoMount (setup script, sama seperti KSU) ──────────────────────────
       - name: Setup NoMount
@@ -311,16 +253,6 @@ jobs:
         env:
           INPUT_ENABLE_NOMOUNT: ${{ github.event.inputs.enable_nomount }}
         run: bash .github/scripts/build_kernel.sh
-
-      - name: Verify vcodec patch compiled (non-fatal)
-        if: github.event.inputs.apply_vcodec_patch == 'true'
-        continue-on-error: true
-        run: |
-          o="$(find "$GITHUB_WORKSPACE" -name mtk_vcodec_enc.o | head -1)"
-          echo "Object: ${o:-<tidak ditemukan>}"
-          [ -n "$o" ] && strings "$o" | grep "not in bitstream table" \
-            && echo "OK: patch ikut ter-compile" \
-            || echo "::warning::tidak bisa membuktikan patch ter-compile (mungkin LTO / out-dir berbeda)"
 
       - name: Upload Build Logs
         if: always()
