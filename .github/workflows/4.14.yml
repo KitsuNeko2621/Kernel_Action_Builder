@@ -18,11 +18,6 @@ on:
         required: false
         type: string
         default: 'bf2f0b665d20312d2f4a32f9e2942f6288ab4633'
-      apply_vcodec_patch:
-        description: 'Terapkan patch vcodec (enum_framesizes raw) dari patches/vcodec-enum-framesizes-raw.patch'
-        required: true
-        type: boolean
-        default: true
       defconfig:
         description: 'Defconfig name (e.g. RM6785_defconfig)'
         required: true
