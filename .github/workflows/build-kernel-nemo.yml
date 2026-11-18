@@ -93,7 +93,7 @@ on:
           - 'zyc'
         default: 'greenforce'
       clang_version:
-        description: 'Greenforce / ZyC: latest | angka major (mis. 19) | tag rilis. WeebX: latest | 16 | 17 | 18 | 19 | tag rilis (mis. WeebX-Clang-19.1.5-release). Neutron: diabaikan. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
+        description: 'Greenforce: latest | angka major (mis. 19) | tag rilis. ZyC: latest (clang 23) | 10-16 | tag (mis. 23.0.0git-20260130-release). WeebX: latest | 16 | 17 | 18 | 19 | tag rilis (mis. WeebX-Clang-19.1.5-release). Neutron: diabaikan. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
         required: false
         type: string
         default: 'latest'
@@ -129,7 +129,18 @@ jobs:
         run: |
           case "$TC" in
             greenforce) repo="greenforce-project/greenforce_clang" ;;
-            zyc)        repo="ZyCromerZ/Clang" ;;
+            zyc)
+              echo "ZyC Clang - isi clang_version dengan: latest | 10-16 | salah satu tag di bawah"
+              B=https://raw.githubusercontent.com/ZyCromerZ/Clang/main
+              echo "  latest = $(curl -fsSL $B/Clang-main-link.txt | awk -F/ '{print $(NF-1)}')"
+              for v in 10 11 12 13 14 15 16; do
+                echo "  $v = $(curl -fsSL $B/Clang-$v-link.txt | awk -F/ '{print $(NF-1)}')"
+              done
+              echo "Tag terbaru (40 terakhir):"
+              git ls-remote --tags https://github.com/ZyCromerZ/Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' | grep -E 'git-[0-9]+-release$|-release$' | grep -v sdclang \
+                | sed 's#^refs/tags/#  #' | tail -40
+              exit 0 ;;
             weebx)
               echo "WeebX Clang - isi clang_version dengan: latest | 16 | 17 | 18 | 19 | salah satu tag di bawah"
               echo "  latest = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/main/link.txt | awk -F/ '{print $(NF-1)}')"
@@ -173,6 +184,8 @@ jobs:
             git make bc bison flex libssl-dev libelf-dev python3 zip unzip curl wget \
             cpio xz-utils zstd lz4 ccache build-essential libncurses-dev \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          # ld.lld bawaan toolchain (WeebX/ZyC/Greenforce) butuh libxml2; nama paket beda antar versi Ubuntu
+          sudo apt-get install -y --no-install-recommends libxml2 || sudo apt-get install -y --no-install-recommends libxml2-16 || true
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -466,32 +479,35 @@ jobs:
               rm -rf "${tmp}"
           }
 
-          # ZyCromerZ Clang (https://github.com/ZyCromerZ/Clang) - biner ada di GitHub Releases
-          ZYC_API="https://api.github.com/repos/ZyCromerZ/Clang/releases"
+          # ZyCromerZ Clang (https://github.com/ZyCromerZ/Clang)
+          # Repo berisi Clang-<major>-link.txt; binarynya di GitHub Releases (tag <versi>-<tanggal>-release)
+          ZYC_RAW="https://raw.githubusercontent.com/ZyCromerZ/Clang/main"
+          ZYC_REL="https://github.com/ZyCromerZ/Clang/releases/download"
 
           download_zyc() {
-              local list line
-              list=$(gf_list "${ZYC_API}")
-              if [ -z "${list}" ]; then
-                  log_error "Gagal mengambil daftar rilis ZyC Clang (jaringan / rate limit GitHub? set GITHUB_TOKEN)."
-                  return 1
-              fi
+              local url="" tag="" t
               case "${GF_CLANG_VERSION}" in
-                  latest)           line=$(head -n1 <<<"${list}") ;;
-                  [0-9]|[0-9][0-9]) line=$(awk -F'\t' -v v="${GF_CLANG_VERSION}" '$2==v{print; exit}' <<<"${list}") ;;
-                  *)                line=$(awk -F'\t' -v v="${GF_CLANG_VERSION}" '$1==v{print; exit}' <<<"${list}") ;;
+                  latest|main)
+                      url=$(curl -fsSL "${ZYC_RAW}/Clang-main-link.txt" | tr -d '[:space:]') ;;
+                  [0-9]|[0-9][0-9])
+                      url=$(curl -fsSL "${ZYC_RAW}/Clang-${GF_CLANG_VERSION}-link.txt" | tr -d '[:space:]') ;;
+                  *)
+                      t="${GF_CLANG_VERSION%-release}"
+                      url="${ZYC_REL}/${t}-release/Clang-${t}.tar.gz" ;;
               esac
-              if [ -z "${line}" ]; then
-                  log_error "Versi ZyC '${GF_CLANG_VERSION}' tidak ditemukan. Versi major yang ada:"
-                  awk -F'\t' '!seen[$2]++{printf "    clang %s\n",$2}' <<<"${list}"
+              if [ -z "${url}" ]; then
+                  log_error "Versi ZyC '${GF_CLANG_VERSION}' tidak ditemukan. Pakai: latest | 10-16 | tag (mis. 23.0.0git-20260130-release)."
                   return 1
               fi
-              local ztag zmajor zurl
-              IFS=$'\t' read -r ztag zmajor zurl <<<"${line}"
-              log_info "ZyC Clang ${zmajor} (tag ${ztag})"
-              log_info "Mengunduh: ${zurl}"
+              tag=$(basename "$(dirname "${url}")")
+              log_info "ZyC Clang (tag ${tag})"
+              log_info "Mengunduh: ${url}"
               local tmp; tmp=$(mktemp -d)
-              wget -q --show-progress -O "${tmp}/clang.tar" "${zurl}" || { rm -rf "${tmp}"; return 1; }
+              wget -q --show-progress -O "${tmp}/clang.tar" "${url}" || {
+                  rm -rf "${tmp}"
+                  log_error "Gagal mengunduh. Tag mungkin salah / asetnya tidak ada di Releases."
+                  return 1
+              }
               mkdir -p "${tmp}/x"
               tar -xf "${tmp}/clang.tar" -C "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal ekstrak arsip ZyC Clang."; return 1; }
               local bin; bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
@@ -504,7 +520,7 @@ jobs:
               rm -rf "${CLANG_DIR}"
               mkdir -p "$(dirname "${CLANG_DIR}")"
               mv "$(dirname "$(dirname "${bin}")")" "${CLANG_DIR}"
-              echo "${ztag}" > "${CLANG_DIR}/.gf_tag"
+              echo "${tag}" > "${CLANG_DIR}/.gf_tag"
               rm -rf "${tmp}"
           }
 
@@ -610,6 +626,45 @@ jobs:
               GF_CLANG_VERSION="${vers[$((ans - 1))]}"
           }
 
+          # Pastikan semua binary toolchain bisa jalan (ld.lld dll. sering butuh libxml2.so.2 / libtinfo.so.5).
+          # Jika lib dengan nama persis tidak ada tapi versi lain ada (mis. libxml2.so.16), buat symlink di <clang>/lib.
+          fix_clang_libs() {
+              local b missing="" m base cand
+              export LD_LIBRARY_PATH="${CLANG_DIR}/lib:${LD_LIBRARY_PATH:-}"
+              for b in "${CLANG_DIR}"/bin/ld.lld "${CLANG_DIR}"/bin/clang "${CLANG_DIR}"/bin/llvm-ar "${CLANG_DIR}"/bin/llvm-nm "${CLANG_DIR}"/bin/llvm-objcopy; do
+                  [ -x "${b}" ] || continue
+                  missing+=$'\n'$(ldd "${b}" 2>/dev/null | awk '/not found/{print $1}')
+              done
+              missing=$(printf '%s\n' "${missing}" | sed '/^$/d' | sort -u)
+              [ -z "${missing}" ] && return 0
+              log_warn "Library toolchain belum ada: $(echo "${missing}" | tr '\n' ' ')"
+              if grep -q '^libxml2' <<<"${missing}"; then
+                  sudo apt-get install -y --no-install-recommends libxml2 >/dev/null 2>&1 \
+                      || sudo apt-get install -y --no-install-recommends libxml2-16 >/dev/null 2>&1 || true
+              fi
+              mkdir -p "${CLANG_DIR}/lib"
+              for m in ${missing}; do
+                  ldconfig -p 2>/dev/null | grep -qF "${m} " && continue
+                  base="${m%%.so*}"
+                  cand=$(ldconfig -p 2>/dev/null | awk -v b="${base}.so" 'index($1,b)==1{print $NF}' | head -n1)
+                  [ -z "${cand}" ] && cand=$(ls /usr/lib/x86_64-linux-gnu/${base}.so.* /lib/x86_64-linux-gnu/${base}.so.* 2>/dev/null | head -n1)
+                  if [ -n "${cand}" ]; then
+                      ln -sf "${cand}" "${CLANG_DIR}/lib/${m}"
+                      log_info "Symlink ${m} -> ${cand}"
+                  fi
+              done
+              local out
+              for b in "${CLANG_DIR}"/bin/ld.lld "${CLANG_DIR}"/bin/clang; do
+                  [ -x "${b}" ] || continue
+                  if ! out=$("${b}" --version 2>&1); then
+                      log_error "$(basename "${b}") masih gagal dijalankan:"
+                      echo "${out}" | head -n3 | sed 's/^/    /'
+                      log_error "Install manual (mis. sudo apt-get install -y libxml2 libncurses6) atau pilih toolchain/versi lain."
+                      exit 1
+                  fi
+              done
+          }
+
           get_clang() {
               choose_clang
               resolve_clang_dir
@@ -626,6 +681,7 @@ jobs:
                   esac || { log_error "Gagal menyiapkan clang. Taruh manual di: ${CLANG_DIR}"; exit 1; }
               fi
               [ -x "${CLANG_DIR}/bin/clang" ] || { log_error "clang masih tidak ditemukan di ${CLANG_DIR}/bin."; exit 1; }
+              fix_clang_libs
               log_success "Clang (${CLANG_TYPE}): $("${CLANG_DIR}/bin/clang" --version | head -n1)"
           }
 
