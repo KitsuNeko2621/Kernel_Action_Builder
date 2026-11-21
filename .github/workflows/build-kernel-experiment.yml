@@ -1,4 +1,4 @@
-name: Build Kernel Nemo (expe)
+name: Build Kernel Nemo (NoMount-Elohim)
 
 # Workflow mandiri: tidak memerlukan file lain di repo (.github/scripts, submodule, dsb).
 # Isi build.sh ditanam di step "Tulis build.sh" di bawah.
@@ -10,7 +10,7 @@ on:
         description: 'URL repo kernel'
         required: true
         type: string
-        default: 'https://github.com/kardebayan/android_kernel_realme_nemo.git'
+        default: 'https://github.com/elohim-etz/android_kernel_realme_mt6785.git'
       kernel_branch:
         description: 'Branch kernel (kosongkan = branch default repo)'
         required: false
@@ -20,7 +20,7 @@ on:
         description: 'Config kernel, pisahkan dengan spasi (kosongkan = deteksi otomatis)'
         required: false
         type: string
-        default: 'k85v1_64_k419_defconfig vendor/nemo.config'
+        default: 'k85v1_64_k419_defconfig vendor/RM6785.config'
       private_repo_token:
         description: 'GitHub token (hanya jika repo kernel privat; lebih aman pakai secret KERNEL_REPO_TOKEN)'
         required: false
@@ -77,33 +77,6 @@ on:
         required: true
         type: string
         default: '100'
-      gpu_max_khz:
-        description: 'GPU (Mali-G76, segmen G90T) frekuensi tertinggi dalam kHz. 0 = tidak diubah (stock 806000). Hanya OPP yang sudah ada di tabel: 821000 atau 835000'
-        required: true
-        type: string
-        default: '821000'
-      cpu_big_max_khz:
-        description: 'CPU A76 (cluster besar, G90T) frekuensi tertinggi. Stock = 2050 MHz. Pilih turun jika reboot acak/freeze'
-        required: true
-        type: choice
-        options:
-          - '0 (stock 2050 MHz)'
-          - '2060000 (2060 MHz)'
-          - '2075000 (2075 MHz)'
-          - '2090000 (2090 MHz)'
-          - '2100000 (2100 MHz)'
-        default: '2100000 (2100 MHz)'
-      cpu_big_volt_steps:
-        description: 'Tambahan voltase OPP tertinggi A76 (1 langkah = 6,25 mV, stock 1.11875 V). Batas voltase driver ikut diangkat otomatis. Naikkan bertahap jika OC belum stabil; lebih tinggi = lebih panas'
-        required: true
-        type: choice
-        options:
-          - '0 (stock 1.11875 V)'
-          - '1 (+6.25 mV = 1.12500 V)'
-          - '2 (+12.5 mV = 1.13125 V)'
-          - '3 (+18.75 mV = 1.13750 V)'
-          - '4 (+25 mV = 1.14375 V)'
-        default: '2 (+12.5 mV = 1.13125 V)'
       aggressive_debug_off:
         description: 'Mode hemat RAM juga mematikan SCHEDSTATS & KPROBES (sedikit lebih ringan, tapi lebih berisiko bootloop). Default OFF'
         required: true
@@ -116,12 +89,19 @@ on:
         options:
           - 'greenforce'
           - 'neutron'
+          - 'weebx'
+          - 'zyc'
         default: 'greenforce'
       clang_version:
-        description: 'Greenforce Clang: latest | angka major (mis. 19) | tag rilis. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
+        description: 'Greenforce: latest | angka major (mis. 19) | tag rilis. ZyC: latest (clang 23) | 10-16 | tag (mis. 23.0.0git-20260130-release). WeebX: latest | 16 | 17 | 18 | 19 | tag rilis (mis. WeebX-Clang-19.1.5-release). Neutron: diabaikan. Setelah ada build yang stabil, isi TAG-nya (tertera di Telegram) agar build bisa diulang persis sama'
         required: false
         type: string
         default: 'latest'
+      list_tags:
+        description: 'Hanya tampilkan daftar tag/branch toolchain yang dipilih (tanpa build). Lihat hasilnya di log, lalu jalankan lagi dan isi clang_version dengan tag-nya'
+        required: false
+        type: boolean
+        default: false
       zip_name:
         description: 'Awalan nama ZIP'
         required: false
@@ -137,7 +117,51 @@ permissions:
   contents: read
 
 jobs:
+  list-tags:
+    if: ${{ inputs.list_tags }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Daftar tag toolchain
+        env:
+          TC: ${{ inputs.clang_toolchain }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$TC" in
+            greenforce) repo="greenforce-project/greenforce_clang" ;;
+            zyc)
+              echo "ZyC Clang - isi clang_version dengan: latest | 10-16 | salah satu tag di bawah"
+              B=https://raw.githubusercontent.com/ZyCromerZ/Clang/main
+              echo "  latest = $(curl -fsSL $B/Clang-main-link.txt | awk -F/ '{print $(NF-1)}')"
+              for v in 10 11 12 13 14 15 16; do
+                echo "  $v = $(curl -fsSL $B/Clang-$v-link.txt | awk -F/ '{print $(NF-1)}')"
+              done
+              echo "Tag terbaru (40 terakhir):"
+              git ls-remote --tags https://github.com/ZyCromerZ/Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' | grep -E 'git-[0-9]+-release$|-release$' | grep -v sdclang \
+                | sed 's#^refs/tags/#  #' | tail -40
+              exit 0 ;;
+            weebx)
+              echo "WeebX Clang - isi clang_version dengan: latest | 16 | 17 | 18 | 19 | salah satu tag di bawah"
+              echo "  latest = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/main/link.txt | awk -F/ '{print $(NF-1)}')"
+              for v in 16 17 18 19; do
+                echo "  $v = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/release/$v.x/link.txt | awk -F/ '{print $(NF-1)}')"
+              done
+              echo "Semua tag:"
+              git ls-remote --tags https://github.com/XSans0/WeebX-Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' | sed 's#^refs/tags/#  #'
+              exit 0 ;;
+            *)
+              echo "Neutron selalu memakai versi terbaru (antman), tidak ada pilihan tag."
+              exit 0 ;;
+          esac
+          echo "${TC} - tag rilis terbaru (isi di clang_version, atau angka major):"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${repo}/releases?per_page=50" \
+            | jq -r '.[] | select(.draft|not) | "  " + .tag_name'
+
   build:
+    if: ${{ !inputs.list_tags }}
     runs-on: ubuntu-latest
     timeout-minutes: 340
     env:
@@ -160,6 +184,8 @@ jobs:
             git make bc bison flex libssl-dev libelf-dev python3 zip unzip curl wget \
             cpio xz-utils zstd lz4 ccache build-essential libncurses-dev \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          # ld.lld bawaan toolchain (WeebX/ZyC/Greenforce) butuh libxml2; nama paket beda antar versi Ubuntu
+          sudo apt-get install -y --no-install-recommends libxml2 || sudo apt-get install -y --no-install-recommends libxml2-16 || true
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -252,11 +278,6 @@ jobs:
           # (fstab: zramsize=75%) ke /sys/block/zram0/disksize; patch ini menaikkannya ke minimal nilai ini,
           # berapa pun yang diminta ROM. Nilai lebih kecil dari ini tidak bisa diset setelah boot.
           ZRAM_MIN_PERCENT="${ZRAM_MIN_PERCENT:-0}"
-          # Frekuensi tertinggi GPU / CPU besar (kHz, 0 = tidak diubah). Lihat patch_opp.
-          GPU_MAX_KHZ="${GPU_MAX_KHZ:-0}"
-          CPU_BIG_MAX_KHZ="${CPU_BIG_MAX_KHZ:-0}"; CPU_BIG_MAX_KHZ="${CPU_BIG_MAX_KHZ%% *}"
-          # Tambahan voltase OPP tertinggi A76 dalam langkah PMIC 6,25 mV (0-4). Pilihan dropdown "2 (+12.5 mV ...)" -> 2.
-          CPU_BIG_VOLT_STEPS="${CPU_BIG_VOLT_STEPS:-0}"; CPU_BIG_VOLT_STEPS="${CPU_BIG_VOLT_STEPS%% *}"
 
           # --- Swappiness ---------------------------------------------------------------
           # 1 = patch source: batas swappiness 100 -> 200 (sysctl & memcg), default diatur di bawah
@@ -290,9 +311,6 @@ jobs:
               SWAPPINESS_PATCH=0
               VM_TUNE=0
               ZRAM_MIN_PERCENT=0
-              GPU_MAX_KHZ=0
-              CPU_BIG_MAX_KHZ=0
-              CPU_BIG_VOLT_STEPS=0
           fi
 
           if [ -f "${PWD}/Makefile" ] && [ -d "${PWD}/arch/arm64" ]; then
@@ -302,13 +320,14 @@ jobs:
           fi
 
           OUT_DIR="${KERNEL_DIR}/out"
-          # Pilihan toolchain: greenforce (default) | neutron
+          # Pilihan toolchain: greenforce (default) | neutron | weebx | zyc
           #   CLANG_TYPE=neutron ./build.sh
-          # Versi Greenforce Clang (hanya untuk CLANG_TYPE=greenforce):
+          # Versi Greenforce / ZyC Clang (untuk CLANG_TYPE=greenforce atau zyc):
           #   GF_CLANG_VERSION=latest     -> rilis terbaru (default)
           #   GF_CLANG_VERSION=17         -> rilis terbaru dari clang 17 (angka major)
           #   GF_CLANG_VERSION=20261031   -> tag rilis tertentu
           #   Daftar yang tersedia: ./build.sh clang-list
+          # WeebX Clang: GF_CLANG_VERSION=latest -> branch default repo, atau isi nama branch/tag.
           # Tanpa env di atas, saat dijalankan di terminal akan muncul MENU pilihan toolchain.
           CLANG_TYPE_SET="${CLANG_TYPE:-}"
           GF_CLANG_VERSION_SET="${GF_CLANG_VERSION:-}"
@@ -376,10 +395,10 @@ jobs:
 
           # Output: <tag> TAB <clang major> TAB <url asset>, rilis terbaru di baris pertama
           gf_list() {
-              local page out auth=()
+              local api="${1:-${GF_API}}" page out auth=()
               [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
               for page in 1 2 3; do
-                  out=$(curl -fsSL "${auth[@]}" "${GF_API}?per_page=100&page=${page}" | python3 -c '
+                  out=$(curl -fsSL "${auth[@]}" "${api}?per_page=100&page=${page}" | python3 -c '
           import sys, json, re
           for r in json.load(sys.stdin):
               if r.get("draft"):
@@ -388,7 +407,7 @@ jobs:
                   n = a["name"]
                   if not n.endswith((".tar.gz", ".tar.zst", ".tar.xz")):
                       continue
-                  m = re.search(r"clang-(\d+)\.\d+\.\d+", n)
+                  m = re.search(r"clang-(\d+)\.\d+\.\d+", n, re.I)
                   print(r["tag_name"], m.group(1) if m else "?", a["browser_download_url"], sep="\t")
                   break
           ') || break
@@ -460,6 +479,96 @@ jobs:
               rm -rf "${tmp}"
           }
 
+          # ZyCromerZ Clang (https://github.com/ZyCromerZ/Clang)
+          # Repo berisi Clang-<major>-link.txt; binarynya di GitHub Releases (tag <versi>-<tanggal>-release)
+          ZYC_RAW="https://raw.githubusercontent.com/ZyCromerZ/Clang/main"
+          ZYC_REL="https://github.com/ZyCromerZ/Clang/releases/download"
+
+          download_zyc() {
+              local url="" tag="" t
+              case "${GF_CLANG_VERSION}" in
+                  latest|main)
+                      url=$(curl -fsSL "${ZYC_RAW}/Clang-main-link.txt" | tr -d '[:space:]') ;;
+                  [0-9]|[0-9][0-9])
+                      url=$(curl -fsSL "${ZYC_RAW}/Clang-${GF_CLANG_VERSION}-link.txt" | tr -d '[:space:]') ;;
+                  *)
+                      t="${GF_CLANG_VERSION%-release}"
+                      url="${ZYC_REL}/${t}-release/Clang-${t}.tar.gz" ;;
+              esac
+              if [ -z "${url}" ]; then
+                  log_error "Versi ZyC '${GF_CLANG_VERSION}' tidak ditemukan. Pakai: latest | 10-16 | tag (mis. 23.0.0git-20260130-release)."
+                  return 1
+              fi
+              tag=$(basename "$(dirname "${url}")")
+              log_info "ZyC Clang (tag ${tag})"
+              log_info "Mengunduh: ${url}"
+              local tmp; tmp=$(mktemp -d)
+              wget -q --show-progress -O "${tmp}/clang.tar" "${url}" || {
+                  rm -rf "${tmp}"
+                  log_error "Gagal mengunduh. Tag mungkin salah / asetnya tidak ada di Releases."
+                  return 1
+              }
+              mkdir -p "${tmp}/x"
+              tar -xf "${tmp}/clang.tar" -C "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal ekstrak arsip ZyC Clang."; return 1; }
+              local bin; bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
+              if [ -z "${bin}" ]; then
+                  log_error "bin/clang tidak ada di arsip ZyC. Isi arsip (level atas):"
+                  ls -la "${tmp}/x" | sed 's/^/    /'
+                  rm -rf "${tmp}"
+                  return 1
+              fi
+              rm -rf "${CLANG_DIR}"
+              mkdir -p "$(dirname "${CLANG_DIR}")"
+              mv "$(dirname "$(dirname "${bin}")")" "${CLANG_DIR}"
+              echo "${tag}" > "${CLANG_DIR}/.gf_tag"
+              rm -rf "${tmp}"
+          }
+
+          # WeebX Clang (https://github.com/XSans0/WeebX-Clang)
+          # Repo hanya berisi link.txt; binarynya ada di GitHub Releases (tag WeebX-Clang-<versi>-release)
+          WEEBX_RAW="https://raw.githubusercontent.com/XSans0/WeebX-Clang/main"
+          WEEBX_REL="https://github.com/XSans0/WeebX-Clang/releases/download"
+
+          download_weebx() {
+              local url="" tag=""
+              case "${GF_CLANG_VERSION}" in
+                  latest)
+                      url=$(curl -fsSL "${WEEBX_RAW}/main/link.txt" | tr -d '[:space:]') ;;
+                  [0-9]|[0-9][0-9])
+                      url=$(curl -fsSL "${WEEBX_RAW}/release/${GF_CLANG_VERSION}.x/link.txt" | tr -d '[:space:]') ;;
+                  *)
+                      tag="${GF_CLANG_VERSION}"
+                      url="${WEEBX_REL}/${tag}/${tag%-release}.tar.gz" ;;
+              esac
+              if [ -z "${url}" ]; then
+                  log_error "Versi WeebX '${GF_CLANG_VERSION}' tidak ditemukan. Pakai: latest | 16 | 17 | 18 | 19 | tag (mis. WeebX-Clang-19.1.5-release)."
+                  return 1
+              fi
+              tag=$(basename "$(dirname "${url}")")
+              log_info "WeebX Clang (tag ${tag})"
+              log_info "Mengunduh: ${url}"
+              local tmp; tmp=$(mktemp -d)
+              wget -q --show-progress -O "${tmp}/clang.tar" "${url}" || {
+                  rm -rf "${tmp}"
+                  log_error "Gagal mengunduh. Tag mungkin salah / asetnya sudah dihapus dari Releases."
+                  return 1
+              }
+              mkdir -p "${tmp}/x"
+              tar -xf "${tmp}/clang.tar" -C "${tmp}/x" || { rm -rf "${tmp}"; log_error "Gagal ekstrak arsip WeebX Clang."; return 1; }
+              local bin; bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
+              if [ -z "${bin}" ]; then
+                  log_error "bin/clang tidak ada di arsip WeebX. Isi arsip (level atas):"
+                  ls -la "${tmp}/x" | sed 's/^/    /'
+                  rm -rf "${tmp}"
+                  return 1
+              fi
+              rm -rf "${CLANG_DIR}"
+              mkdir -p "$(dirname "${CLANG_DIR}")"
+              mv "$(dirname "$(dirname "${bin}")")" "${CLANG_DIR}"
+              echo "${tag}" > "${CLANG_DIR}/.gf_tag"
+              rm -rf "${tmp}"
+          }
+
           download_neutron() {
               mkdir -p "${CLANG_DIR}" && pushd "${CLANG_DIR}" >/dev/null || return 1
               bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S=latest
@@ -473,6 +582,8 @@ jobs:
                   CLANG_DIR="${CLANG_DIR_USER}"
               elif [ "${CLANG_TYPE}" = "greenforce" ]; then
                   CLANG_DIR="${KERNEL_DIR}/../clang-greenforce-${GF_CLANG_VERSION}"
+              elif [ "${CLANG_TYPE}" = "zyc" ] || [ "${CLANG_TYPE}" = "weebx" ]; then
+                  CLANG_DIR="${KERNEL_DIR}/../clang-${CLANG_TYPE}-${GF_CLANG_VERSION//\//_}"
               else
                   CLANG_DIR="${KERNEL_DIR}/../clang-${CLANG_TYPE}"
               fi
@@ -500,6 +611,8 @@ jobs:
                   log_warn "Daftar Greenforce Clang tidak bisa diambil, hanya Neutron yang ditawarkan."
               fi
               labels+=("Neutron Clang (Antman, terbaru)"); types+=(neutron); vers+=(latest)
+              labels+=("WeebX Clang (terbaru)"); types+=(weebx); vers+=(latest)
+              labels+=("ZyC Clang (rilis terbaru)"); types+=(zyc); vers+=(latest)
 
               echo "Pilih toolchain:"
               local i
@@ -513,20 +626,62 @@ jobs:
               GF_CLANG_VERSION="${vers[$((ans - 1))]}"
           }
 
+          # Pastikan semua binary toolchain bisa jalan (ld.lld dll. sering butuh libxml2.so.2 / libtinfo.so.5).
+          # Jika lib dengan nama persis tidak ada tapi versi lain ada (mis. libxml2.so.16), buat symlink di <clang>/lib.
+          fix_clang_libs() {
+              local b missing="" m base cand
+              export LD_LIBRARY_PATH="${CLANG_DIR}/lib:${LD_LIBRARY_PATH:-}"
+              for b in "${CLANG_DIR}"/bin/ld.lld "${CLANG_DIR}"/bin/clang "${CLANG_DIR}"/bin/llvm-ar "${CLANG_DIR}"/bin/llvm-nm "${CLANG_DIR}"/bin/llvm-objcopy; do
+                  [ -x "${b}" ] || continue
+                  missing+=$'\n'$(ldd "${b}" 2>/dev/null | awk '/not found/{print $1}')
+              done
+              missing=$(printf '%s\n' "${missing}" | sed '/^$/d' | sort -u)
+              [ -z "${missing}" ] && return 0
+              log_warn "Library toolchain belum ada: $(echo "${missing}" | tr '\n' ' ')"
+              if grep -q '^libxml2' <<<"${missing}"; then
+                  sudo apt-get install -y --no-install-recommends libxml2 >/dev/null 2>&1 \
+                      || sudo apt-get install -y --no-install-recommends libxml2-16 >/dev/null 2>&1 || true
+              fi
+              mkdir -p "${CLANG_DIR}/lib"
+              for m in ${missing}; do
+                  ldconfig -p 2>/dev/null | grep -qF "${m} " && continue
+                  base="${m%%.so*}"
+                  cand=$(ldconfig -p 2>/dev/null | awk -v b="${base}.so" 'index($1,b)==1{print $NF}' | head -n1)
+                  [ -z "${cand}" ] && cand=$(ls /usr/lib/x86_64-linux-gnu/${base}.so.* /lib/x86_64-linux-gnu/${base}.so.* 2>/dev/null | head -n1)
+                  if [ -n "${cand}" ]; then
+                      ln -sf "${cand}" "${CLANG_DIR}/lib/${m}"
+                      log_info "Symlink ${m} -> ${cand}"
+                  fi
+              done
+              local out
+              for b in "${CLANG_DIR}"/bin/ld.lld "${CLANG_DIR}"/bin/clang; do
+                  [ -x "${b}" ] || continue
+                  if ! out=$("${b}" --version 2>&1); then
+                      log_error "$(basename "${b}") masih gagal dijalankan:"
+                      echo "${out}" | head -n3 | sed 's/^/    /'
+                      log_error "Install manual (mis. sudo apt-get install -y libxml2 libncurses6) atau pilih toolchain/versi lain."
+                      exit 1
+                  fi
+              done
+          }
+
           get_clang() {
               choose_clang
               resolve_clang_dir
               # CLANG_REFRESH=1 -> unduh ulang (berguna untuk GF_CLANG_VERSION=latest)
-              [ "${CLANG_REFRESH:-0}" = "1" ] && [ "${CLANG_TYPE}" = "greenforce" ] && [ -z "${CLANG_DIR_USER}" ] && rm -rf "${CLANG_DIR}"
+              [ "${CLANG_REFRESH:-0}" = "1" ] && [ "${CLANG_TYPE}" != "neutron" ] && [ -z "${CLANG_DIR_USER}" ] && rm -rf "${CLANG_DIR}"
               if [ ! -x "${CLANG_DIR}/bin/clang" ]; then
                   log_warn "Clang (${CLANG_TYPE}) tidak ditemukan di ${CLANG_DIR}. Mengunduh..."
                   case "${CLANG_TYPE}" in
                       greenforce) download_greenforce ;;
                       neutron)    download_neutron ;;
-                      *) log_error "CLANG_TYPE tidak dikenal: ${CLANG_TYPE} (pilih: greenforce | neutron)"; exit 1 ;;
+                      weebx)      download_weebx ;;
+                      zyc)        download_zyc ;;
+                      *) log_error "CLANG_TYPE tidak dikenal: ${CLANG_TYPE} (pilih: greenforce | neutron | weebx | zyc)"; exit 1 ;;
                   esac || { log_error "Gagal menyiapkan clang. Taruh manual di: ${CLANG_DIR}"; exit 1; }
               fi
               [ -x "${CLANG_DIR}/bin/clang" ] || { log_error "clang masih tidak ditemukan di ${CLANG_DIR}/bin."; exit 1; }
+              fix_clang_libs
               log_success "Clang (${CLANG_TYPE}): $("${CLANG_DIR}/bin/clang" --version | head -n1)"
           }
 
@@ -881,142 +1036,6 @@ jobs:
               [ "${PIPESTATUS[0]}" -eq 0 ] || log_warn "Patch ukuran zram dilewati (lihat pesan di atas)."
           }
 
-          # Frekuensi tertinggi GPU/CPU dan voltase OPP tertinggi A76 lewat tabel OPP driver MediaTek (mt6785).
-          # Lokasi file dicari dari nama simbol; semua salinan mt6785 di repo ditambal.
-          # Tidak ada yang berhasil / nilai tidak valid -> build dihentikan.
-          patch_opp() {
-              [ "${GPU_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_MAX_KHZ}" = "0" ] && [ "${CPU_BIG_VOLT_STEPS}" = "0" ] && return 0
-              local v
-              for v in "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" "${CPU_BIG_VOLT_STEPS}"; do
-                  [[ "${v}" =~ ^[0-9]+$ ]] || { log_error "GPU_MAX_KHZ/CPU_BIG_MAX_KHZ/CPU_BIG_VOLT_STEPS harus angka (sekarang: '${v}')"; exit 1; }
-              done
-              log_info "Patch OPP: GPU max=${GPU_MAX_KHZ} kHz, CPU A76 max=${CPU_BIG_MAX_KHZ} kHz, voltase +${CPU_BIG_VOLT_STEPS} langkah x 6,25 mV (0 = tidak diubah)"
-              python3 - "${KERNEL_DIR}" "${GPU_MAX_KHZ}" "${CPU_BIG_MAX_KHZ}" "${CPU_BIG_VOLT_STEPS}" <<'PY' 2>&1 | tee -a "${LOG_FILE}"
-          import os, re, subprocess, sys
-          root = sys.argv[1]
-          gpu_khz, cpu_khz, steps = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-          failed = False
-
-          def err(msg):
-              global failed
-              failed = True
-              print(f"[ERROR] {msg}")
-
-          def warn(msg):
-              print(f"[WARN] {msg}")
-
-          def rel(p):
-              return p.replace(root + "/", "")
-
-          def find(pattern, glob):
-              r = subprocess.run(["grep", "-rlE", "--include=" + glob, pattern, root + "/drivers"],
-                                 capture_output=True, text=True)
-              return sorted(r.stdout.split())
-
-          def put(s, edits):
-              # edits: [(match, group, new_value)] -> ganti dari belakang agar indeks tetap valid
-              for m, g, v in sorted(edits, key=lambda e: e[0].start(e[1]), reverse=True):
-                  s = s[:m.start(g)] + str(v) + s[m.end(g):]
-              return s
-
-          # Repo bisa punya beberapa salinan driver (mis. drivers/gpu/... dan drivers/misc/...).
-          # Semua salinan mt6785 ditambal; mana yang dikompilasi tidak perlu ditebak.
-
-          # ---- GPU: OPP tertinggi segmen MT6785T (G90T), hanya ke OPP yang SUDAH ada di tabel ----
-          if gpu_khz:
-              srcs = [f for f in find(r"g_segment_max_opp_idx = [0-9]+;", "*.c") if "MT6785T_SEGMENT" in open(f).read()]
-              if not srcs:
-                  err("driver gpufreq dengan MT6785T_SEGMENT tidak ditemukan")
-              done = 0
-              for c in srcs:
-                  h = os.path.join(os.path.dirname(c), "mtk_gpufreq_core.h")
-                  if not os.path.isfile(h):
-                      warn(f"{rel(c)}: mtk_gpufreq_core.h tidak ada di folder yang sama, dilewati")
-                      continue
-                  idx_of = {int(m.group(2)): int(m.group(1)) for m in
-                            re.finditer(r"#define\s+SEG_GPU_DVFS_FREQ(\d+)\s*\((\d+)\)", open(h).read())}
-                  ok = ", ".join(str(k) for k, v in sorted(idx_of.items()) if 13 <= v <= 15)
-                  if gpu_khz not in idx_of:
-                      err(f"{rel(h)}: GPU {gpu_khz} kHz bukan OPP di tabel (OPP 13-15: {ok})")
-                      continue
-                  idx = idx_of[gpu_khz]
-                  if not 13 <= idx <= 15:
-                      err(f"GPU {gpu_khz} kHz = OPP {idx}; hanya OPP 13-15 yang diizinkan (OPP lebih tinggi tidak divalidasi untuk G90T)")
-                      continue
-                  src = open(c).read()
-                  pat = re.compile(r"(else if \(g_segment_id == MT6785T_SEGMENT\)\s*\n\s*g_segment_max_opp_idx = )(\d+)(;)")
-                  if not pat.search(src):
-                      warn(f"{rel(c)}: pola g_segment_max_opp_idx MT6785T tidak cocok, dilewati")
-                      continue
-                  open(c, "w").write(pat.sub(lambda m: m.group(1) + str(idx) + m.group(3), src, count=1))
-                  print(f"[PATCH] {rel(c)}: G90T OPP tertinggi = OPP {idx} ({gpu_khz} kHz)")
-                  done += 1
-              if done == 0 and not failed:
-                  err("tidak ada salinan driver GPU yang berhasil ditambal")
-
-          # ---- CPU A76 (cluster "L", segmen 6785T), OPP0: frekuensi dan/atau voltase ----
-          # Voltase: 1 langkah = 6,25 mV (625 dalam satuan 10uV). Stock OPP0 = 111875 (1,11875 V) = kode PMIC 115.
-          # Batas MAX_VPROC_VOLT / MAX_VSRAM_VOLT (stock 112000) ikut diangkat, kalau tidak kenaikan di-clamp.
-          if cpu_khz or steps:
-              ok = True
-              if cpu_khz and (cpu_khz % 1000 or not 2050000 <= cpu_khz <= 2100000):
-                  err(f"CPU_BIG_MAX_KHZ={cpu_khz}: harus kelipatan 1000 dan di antara 2050000-2100000")
-                  ok = False
-              if not 0 <= steps <= 4:
-                  err(f"CPU_BIG_VOLT_STEPS={steps}: harus 0-4 (maks +25 mV)")
-                  ok = False
-              if ok:
-                  target_khz = cpu_khz or 2050000
-                  mhz = target_khz // 1000
-                  volt = 111875 + 625 * steps
-                  code = 115 + steps
-                  vmax = 112000 + 625 * steps
-                  n_opp = n_pv = n_plat = 0
-
-                  for o in find(r"CPU_DVFS_FREQ0_L_6785T\b", "*.h"):
-                      s = open(o).read()
-                      mf = re.search(r"(#define\s+CPU_DVFS_FREQ0_L_6785T\s+)(\d+)", s)
-                      mv = re.search(r"(#define\s+CPU_DVFS_VOLT0_VPROC2_6785T\s+)(\d+)", s)
-                      if (not mf or not mv or not 2050000 <= int(mf.group(2)) <= 2100000
-                              or (int(mv.group(2)) - 111875) % 625 or not 0 <= (int(mv.group(2)) - 111875) // 625 <= 4):
-                          warn(f"{rel(o)}: OPP0 A76 6785T bernilai tak terduga, dilewati")
-                          continue
-                      open(o, "w").write(put(s, [(mf, 2, target_khz), (mv, 2, volt)]))
-                      print(f"[PATCH] {rel(o)}: A76 OPP0 = {target_khz} kHz @ {volt/100000:.5f} V")
-                      n_opp += 1
-
-                  for p in find(r"FY_6785TTbl\b", "*.h"):
-                      t = open(p).read()
-                      blk = re.search(r"static unsigned int FY_6785TTbl\[.*?\n\};", t, re.S)
-                      row = re.search(r"(/\* L \*/\s*\n\s*\{\s*)(\d+)(,\s*)(\d+)(,\s*1,\s*1\s*\})", blk.group(0)) if blk else None
-                      if not row or not 2050 <= int(row.group(2)) <= 2100 or not 115 <= int(row.group(4)) <= 119:
-                          warn(f"{rel(p)}: baris OPP0 cluster L di FY_6785TTbl tidak cocok, dilewati")
-                          continue
-                      nb = put(blk.group(0), [(row, 2, mhz), (row, 4, code)])
-                      open(p, "w").write(t[:blk.start()] + nb + t[blk.end():])
-                      print(f"[PATCH] {rel(p)}: OPP0 cluster L (6785T) = {mhz} MHz, kode voltase {code}")
-                      n_pv += 1
-
-                  if steps:
-                      for f in find(r"mediatek,mt6785-dvfsp", "*.h"):
-                          s = open(f).read()
-                          mp = re.search(r"(#define\s+MAX_VPROC_VOLT\s+)(\d+)", s)
-                          ms = re.search(r"(#define\s+MAX_VSRAM_VOLT\s+)(\d+)", s)
-                          if not mp or not ms or not all(112000 <= int(x.group(2)) <= 112000 + 625 * 4 for x in (mp, ms)):
-                              warn(f"{rel(f)}: MAX_VPROC_VOLT/MAX_VSRAM_VOLT tak terduga, dilewati")
-                              continue
-                          open(f, "w").write(put(s, [(mp, 2, vmax), (ms, 2, vmax)]))
-                          print(f"[PATCH] {rel(f)}: MAX_VPROC_VOLT = MAX_VSRAM_VOLT = {vmax}")
-                          n_plat += 1
-
-                  if n_opp == 0 or n_pv == 0 or (steps and n_plat == 0):
-                      err(f"tabel CPU belum lengkap ditambal (tabel OPP: {n_opp}, tabel PV: {n_pv}, batas voltase: {n_plat})")
-
-          sys.exit(1 if failed else 0)
-          PY
-              [ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "Patch OPP gagal, build dihentikan."; exit 1; }
-          }
-
           # Opsi config hemat RAM, diterapkan ke out/.config (tidak mengubah file defconfig di source)
           apply_lowram_config() {
               [ "${LOWRAM}" = "1" ] || return 0
@@ -1265,7 +1284,6 @@ jobs:
                   patch_dtb_append
                   patch_zram_compressor
                   patch_zram_size
-                  patch_opp
                   setup_nomount
                   [ "${INCREMENTAL:-0}" = "1" ] || cleanup
                   mkdir -p "${OUT_DIR}"
@@ -1295,9 +1313,6 @@ jobs:
           LOWRAM: ${{ inputs.lowram_mode == 'off' && '0' || '1' }}
           LOWRAM_AGGRESSIVE: ${{ inputs.aggressive_debug_off && '1' || '0' }}
           ZRAM_MIN_PERCENT: ${{ inputs.zram_size_percent }}
-          GPU_MAX_KHZ: ${{ inputs.gpu_max_khz }}
-          CPU_BIG_MAX_KHZ: ${{ inputs.cpu_big_max_khz }}
-          CPU_BIG_VOLT_STEPS: ${{ inputs.cpu_big_volt_steps }}
           ZRAM_COMP: ${{ inputs.lowram_mode == 'off' && 'lz4' || inputs.lowram_mode }}
           CLANG_TYPE: ${{ inputs.clang_toolchain }}
           GF_CLANG_VERSION: ${{ inputs.clang_version }}
@@ -1378,9 +1393,6 @@ jobs:
           SWAP_LOCK: ${{ inputs.swappiness_lock && 'locked' || 'unlocked' }}
           LOWRAM_IN: ${{ inputs.lowram_mode }}
           ZRAM_PCT_IN: ${{ inputs.stable_mode && '0' || inputs.zram_size_percent }}
-          GPU_OC_IN: ${{ inputs.stable_mode && '0' || inputs.gpu_max_khz }}
-          CPU_OC_IN: ${{ inputs.stable_mode && '0' || inputs.cpu_big_max_khz }}
-          CPU_V_IN: ${{ inputs.stable_mode && '0' || inputs.cpu_big_volt_steps }}
           CLANG_NAME: ${{ inputs.clang_toolchain }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
@@ -1396,12 +1408,6 @@ jobs:
           [ "$SWAP_IN" != "off" ] && swap="${SWAP_IN} (${SWAP_LOCK})"
           zr="$LOWRAM_IN"
           [ "${ZRAM_PCT_IN:-0}" != "0" ] && zr="${LOWRAM_IN}, min ${ZRAM_PCT_IN}% RAM"
-          oc=""
-          gpu_oc="${GPU_OC_IN%% *}"
-          [ "${gpu_oc:-0}" != "0" ] && oc="GPU ${gpu_oc} kHz"
-          cpu_oc="${CPU_OC_IN%% *}"; cpu_v="${CPU_V_IN%% *}"
-          [ "${cpu_oc:-0}" != "0" ] && oc="${oc:+$oc, }CPU A76 ${cpu_oc} kHz"
-          [ "${cpu_v:-0}" != "0" ] && oc="${oc:+$oc, }volt A76 +$(awk "BEGIN{print ${cpu_v}*6.25}") mV"
           cap="$(mktemp)"
           {
             printf '✅ *Build Successful* ✅\n\n'
@@ -1413,8 +1419,8 @@ jobs:
             printf '*Kernel:* %s\n' "$(esc "$KERNEL_RELEASE")"
             printf '*Swappiness:* %s\n' "$(esc "$swap")"
             printf '*Zram:* %s\n' "$(esc "$zr")"
-            if [ -n "$oc" ]; then printf '*Max freq:* %s\n' "$(esc "$oc")"; fi
-            printf '*Clang:* %s\n' "$(esc "${CLANG_NAME^} $CLANG_INFO${CLANG_TAG:+ (tag $CLANG_TAG)}")"
+            case "$CLANG_NAME" in weebx) cname="WeebX" ;; zyc) cname="ZyC" ;; *) cname="${CLANG_NAME^}" ;; esac
+            printf '*Clang:* %s\n' "$(esc "$cname $CLANG_INFO${CLANG_TAG:+ (tag $CLANG_TAG)}")"
             if [ -n "$CUSTOM_NOTE" ]; then printf '\n*Note:* %s\n' "$(esc "$CUSTOM_NOTE")"; fi
             printf '\n[View Run](%s)\n' "$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
           } > "$cap"
