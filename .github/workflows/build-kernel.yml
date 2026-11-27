@@ -75,7 +75,7 @@ jobs:
       USE_CCACHE: 1
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git"
+      CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r596125.git"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AnyKernel3.git"
       ANYKERNEL_BRANCH: "master"
       CLANG_TOOLCHAIN: ${{ github.event.inputs.clang_toolchain }}
@@ -130,7 +130,7 @@ jobs:
         id: cache-clang
         with:
           path: clang
-          key: clang-r547379
+          key: clang-r596125
 
       - name: Clone AOSP Clang Toolchain
         if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
