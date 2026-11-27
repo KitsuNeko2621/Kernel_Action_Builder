@@ -28,6 +28,7 @@ fi
   echo "KERNEL_COMMIT=${FULL_COMMIT:0:8}"
   echo "KERNEL_COMMIT_URL=${COMMIT_URL}"
   echo "DEFCONFIG=${INPUT_DEFCONFIG}"
+  echo "CONFIG_FRAGMENTS=${INPUT_FRAGMENTS}"
 } >> "$GITHUB_ENV"
 
 echo "KERNEL_VERSION=$(make kernelversion 2>/dev/null || echo 'unknown')" >> "$GITHUB_ENV"

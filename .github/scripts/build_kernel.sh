@@ -21,6 +21,45 @@ make O=out \
      "${DEFCONFIG}" \
      2>&1 | tee -a "$BUILD_LOG"
 
+FRAGMENTS="${CONFIG_FRAGMENTS}"
+if [ "${ENABLE_KSU}" == "true" ]; then
+  if [ -n "${FRAGMENTS}" ]; then
+    FRAGMENTS="${FRAGMENTS} ksu.config"
+  else
+    FRAGMENTS="ksu.config"
+  fi
+fi
+
+if [ -n "${FRAGMENTS}" ]; then
+  echo "=== Merging config fragments: ${FRAGMENTS} ===" | tee -a "$BUILD_LOG"
+
+  read -r -a FRAGMENT_LIST <<< "${FRAGMENTS}"
+  MERGE_FILES=("out/.config")
+
+  for frag in "${FRAGMENT_LIST[@]}"; do
+    if [ -f "${frag}" ]; then
+      frag_path="${frag}"
+    elif [ -f "arch/${ARCH}/configs/${frag}" ]; then
+      frag_path="arch/${ARCH}/configs/${frag}"
+    else
+      echo "ERROR: config fragment '${frag}' not found in ./ or arch/${ARCH}/configs/" | tee -a "$BUILD_LOG"
+      exit 1
+    fi
+    echo "  + ${frag_path}" | tee -a "$BUILD_LOG"
+    MERGE_FILES+=("${frag_path}")
+  done
+
+  if [ -f scripts/kconfig/merge_config.sh ]; then
+    bash scripts/kconfig/merge_config.sh -m -O out "${MERGE_FILES[@]}" 2>&1 | tee -a "$BUILD_LOG"
+  else
+    # Fallback: plain concatenation (later entries win after olddefconfig)
+    cat "${MERGE_FILES[@]}" > out/.config.tmp
+    mv out/.config.tmp out/.config
+  fi
+
+  make O=out ARCH="${ARCH}" olddefconfig 2>&1 | tee -a "$BUILD_LOG"
+fi
+
 echo "=== Starting kernel build ===" | tee -a "$BUILD_LOG"
 make -j"$(nproc --all)" \
      O=out \
