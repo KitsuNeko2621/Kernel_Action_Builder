@@ -1,9 +1,9 @@
-name: Build Kernel (Universal)
+name: Build Kernel (AIO)
 
 # NOTE: GitHub allows at most 25 workflow_dispatch inputs; this workflow uses 23.
 # Features merged in from the "experiment" workflow (NoMount, swappiness, zram,
 # low-RAM mode, VM tuning, localversion, stable mode, extra toolchains, list_tags) live in
-# .github/scripts/*.sh -- nothing is embedded in this file.
+# scripts that this file writes to .ci-scripts/ at the start of the run, so it works as a single file.
 
 on:
   workflow_dispatch:
@@ -257,11 +257,1243 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           df -h /
 
-      - name: Checkout Workflow Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
+      # ── Scripts (written from this file; no other files needed in the repo) ─
+      - name: Write Build Scripts
+        run: |
+          mkdir -p .ci-scripts
+          cat > .ci-scripts/common.sh <<'CI_SCRIPT_COMMON_EOF'
+          #!/usr/bin/env bash
+          # Shared helpers. Source from other scripts:  source "$(dirname "$0")/common.sh"
+
+          RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+
+          BUILD_LOG="${BUILD_LOG:-${GITHUB_WORKSPACE:-$PWD}/logs/build.log}"
+          mkdir -p "$(dirname "${BUILD_LOG}")"
+
+          _log_file()   { echo "$*" >> "${BUILD_LOG}"; return 0; }
+          log_info()    { echo -e "${BLUE}[INFO]${NC} $1";   _log_file "[INFO] $1"; }
+          log_success() { echo -e "${GREEN}[OK]${NC} $1";    _log_file "[OK] $1"; }
+          log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; _log_file "[WARN] $1"; echo "::warning::$1"; }
+          log_error()   { echo -e "${RED}[ERROR]${NC} $1";   _log_file "[ERROR] $1"; echo "::error::$1"; }
+
+          # Append KEY=VALUE to the job environment (no-op outside GitHub Actions)
+          set_env() { [ -n "${GITHUB_ENV:-}" ] && echo "$1=$2" >> "${GITHUB_ENV}"; export "$1=$2"; }
+          CI_SCRIPT_COMMON_EOF
+          cat > .ci-scripts/resolve_options.sh <<'CI_SCRIPT_RESOLVE_OPTIONS_EOF'
+          #!/usr/bin/env bash
+          # Validates workflow inputs and resolves the *effective* options used by the
+          # later steps. Everything is exported to $GITHUB_ENV.
+          #
+          # stable_mode = conservative comparison build (handy when hunting a bootloop):
+          # it switches off KernelSU/SUSFS, NoMount, low-RAM mode, swappiness and VM/zram patches.
+          set -euo pipefail
+          source "$(dirname "$0")/common.sh"
+
+          # trim leading/trailing whitespace (inputs typed by hand often carry stray spaces)
+          trim() { local v="${1:-}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
+          b() { [ "$(trim "${1:-}")" = "true" ] && echo 1 || echo 0; }   # "true" -> 1, anything else -> 0
+
+          STABLE=$(b "${INPUT_STABLE_MODE:-false}")
+          ENABLE_KSU=$(trim "${INPUT_ENABLE_KSU:-false}")
+          NOMOUNT=$(b "${INPUT_ENABLE_NOMOUNT:-false}")
+          VM_TUNE=$(b "${INPUT_VM_TUNE:-false}")
+          SWAPPINESS_LOCK=$(b "${INPUT_SWAPPINESS_LOCK:-false}")
+          SWAPPINESS_DEFAULT=$(trim "${INPUT_SWAPPINESS_DEFAULT:-off}")
+          LOWRAM_MODE=$(trim "${INPUT_LOWRAM_MODE:-off}")
+          LOWRAM_AGGRESSIVE=$(b "${INPUT_AGGRESSIVE_DEBUG_OFF:-false}")
+          ZRAM_MIN_PERCENT=$(trim "${INPUT_ZRAM_SIZE_PERCENT:-0}")
+          ZRAM_MIN_PERCENT="${ZRAM_MIN_PERCENT%\%}"          # accept "100%"
+          [ -n "${ZRAM_MIN_PERCENT}" ] || ZRAM_MIN_PERCENT=0   # empty = unchanged
+          LOCALVERSION_SUFFIX=$(trim "${INPUT_LOCALVERSION:-}")
+
+          # ── swappiness: "off" disables the patch ───────────────────────────────────
+          if [ "${SWAPPINESS_DEFAULT}" = "off" ] || [ -z "${SWAPPINESS_DEFAULT}" ]; then
+            SWAPPINESS_PATCH=0; SWAPPINESS_DEFAULT=100
+          else
+            SWAPPINESS_PATCH=1
+            if ! [[ "${SWAPPINESS_DEFAULT}" =~ ^[0-9]+$ ]] || [ "${SWAPPINESS_DEFAULT}" -gt 200 ]; then
+              log_error "swappiness_default must be a number 0-200 or 'off' (got '${SWAPPINESS_DEFAULT}')"; exit 1
+            fi
+          fi
+
+          # ── zram size: 0 = unchanged ───────────────────────────────────────────────
+          if ! [[ "${ZRAM_MIN_PERCENT}" =~ ^[0-9]+$ ]] || [ "${ZRAM_MIN_PERCENT}" -gt 200 ]; then
+            log_error "zram_size_percent must be a number 0-200 (got '${ZRAM_MIN_PERCENT}')"; exit 1
+          fi
+
+          # ── low-RAM mode + zram compressor ─────────────────────────────────────────
+          if [ "${LOWRAM_MODE}" = "off" ]; then LOWRAM=0; ZRAM_COMP="lz4"; else LOWRAM=1; ZRAM_COMP="${LOWRAM_MODE}"; fi
+
+          # ── localversion: empty = leave the kernel's own version string alone ──────
+          if [[ "${LOCALVERSION_SUFFIX}" =~ [[:space:]] ]] || [ "${#LOCALVERSION_SUFFIX}" -gt 64 ]; then
+            log_error "localversion must not contain spaces and is limited to 64 characters: '${LOCALVERSION_SUFFIX}'"; exit 1
+          fi
+
+          # ── stable mode overrides everything above ─────────────────────────────────
+          if [ "${STABLE}" = "1" ]; then
+            ENABLE_KSU="false"; NOMOUNT=0; VM_TUNE=0
+            SWAPPINESS_PATCH=0; LOWRAM=0; ZRAM_MIN_PERCENT=0
+            log_info "stable_mode ON: KernelSU/SUSFS, NoMount, low-RAM, swappiness and VM/zram patches are disabled."
+          fi
+
+          # ── toolchain ──────────────────────────────────────────────────────────────
+          CLANG_TYPE=$(echo "${INPUT_CLANG_TOOLCHAIN:-AOSP}" | tr '[:upper:]' '[:lower:]')
+          case "${CLANG_TYPE}" in aosp|neutron|greenforce|weebx|zyc) ;; *)
+            log_error "Unknown clang_toolchain: ${INPUT_CLANG_TOOLCHAIN}"; exit 1 ;; esac
+
+          {
+            echo "STABLE=${STABLE}"
+            echo "ENABLE_KSU=${ENABLE_KSU}"
+            echo "NOMOUNT=${NOMOUNT}"
+            echo "NOMOUNT_REF=${INPUT_NOMOUNT_REF:-dev}"
+            echo "VM_TUNE=${VM_TUNE}"
+            echo "SWAPPINESS_PATCH=${SWAPPINESS_PATCH}"
+            echo "SWAPPINESS_DEFAULT=${SWAPPINESS_DEFAULT}"
+            echo "SWAPPINESS_LOCK=${SWAPPINESS_LOCK}"
+            echo "LOWRAM=${LOWRAM}"
+            echo "LOWRAM_AGGRESSIVE=${LOWRAM_AGGRESSIVE}"
+            echo "ZRAM_COMP=${ZRAM_COMP}"
+            echo "ZRAM_MIN_PERCENT=${ZRAM_MIN_PERCENT}"
+            echo "LOCALVERSION_SUFFIX=${LOCALVERSION_SUFFIX}"
+            echo "CLANG_TYPE=${CLANG_TYPE}"
+            echo "GF_CLANG_VERSION=${INPUT_CLANG_VERSION:-latest}"
+          } >> "${GITHUB_ENV}"
+
+          log_info "Resolved: ksu=${ENABLE_KSU}/${INPUT_KSU_VARIANT:-}, nomount=${NOMOUNT}, vm_tune=${VM_TUNE}, swappiness=${SWAPPINESS_PATCH}(${SWAPPINESS_DEFAULT}, lock=${SWAPPINESS_LOCK}), lowram=${LOWRAM}(${ZRAM_COMP}), zram_min=${ZRAM_MIN_PERCENT}%, clang=${CLANG_TYPE}"
+          CI_SCRIPT_RESOLVE_OPTIONS_EOF
+          cat > .ci-scripts/telegram_common.sh <<'CI_SCRIPT_TELEGRAM_COMMON_EOF'
+          #!/usr/bin/env bash
+
+          # Escape plain text for MarkdownV2
+          esc() { printf '%s' "$1" | sed 's/[]\_*[()~`>#+=|{}.!-]/\\&/g'; }
+
+          # Escape a URL used inside a MarkdownV2 inline link
+          esc_url() { printf '%s' "$1" | sed 's/[\\()]/\\&/g'; }
+          CI_SCRIPT_TELEGRAM_COMMON_EOF
+          cat > .ci-scripts/clone_kernel.sh <<'CI_SCRIPT_CLONE_KERNEL_EOF'
+          #!/usr/bin/env bash
+          set -e
+          source "$(dirname "$0")/common.sh"
+
+          KERNEL_REPO_INPUT="${INPUT_KERNEL_REPO}"
+          PRIVATE_TOKEN="${INPUT_PRIVATE_TOKEN:-}"
+
+          [ -n "${PRIVATE_TOKEN}" ] && echo "::add-mask::${PRIVATE_TOKEN}"
+
+          # Token: GitHub uses x-access-token, GitLab (and others) use oauth2
+          if [ -n "${PRIVATE_TOKEN}" ]; then
+            if echo "${KERNEL_REPO_INPUT}" | grep -q "github.com"; then
+              AUTHED_URL="${KERNEL_REPO_INPUT/https:\/\//https://x-access-token:${PRIVATE_TOKEN}@}"
+            else
+              AUTHED_URL="${KERNEL_REPO_INPUT/https:\/\//https://oauth2:${PRIVATE_TOKEN}@}"
+            fi
+          else
+            AUTHED_URL="${KERNEL_REPO_INPUT}"
+          fi
+
+          # Empty branch = the repository's default branch
+          BRANCH_OPT=()
+          [ -n "${INPUT_KERNEL_BRANCH:-}" ] && BRANCH_OPT=(-b "${INPUT_KERNEL_BRANCH}")
+
+          git clone --depth=1 "${BRANCH_OPT[@]}" "${AUTHED_URL}" kernel || {
+            log_error "Failed to clone kernel source (check URL / branch / token)."
+            exit 1
+          }
+          cd kernel
+
+          # Never keep the token in .git/config
+          git remote set-url origin "${KERNEL_REPO_INPUT}" 2>/dev/null || true
+
+          REPO_BASE=$(echo "${KERNEL_REPO_INPUT}" | sed 's|\.git$||')
+          FULL_COMMIT=$(git rev-parse HEAD)
+          BRANCH_NAME="${INPUT_KERNEL_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo default)}"
+          if echo "${REPO_BASE}" | grep -q "gitlab"; then
+            COMMIT_URL="${REPO_BASE}/-/commit/${FULL_COMMIT}"
+          else
+            COMMIT_URL="${REPO_BASE}/commit/${FULL_COMMIT}"
+          fi
+
+          {
+            echo "KERNEL_REPO=${KERNEL_REPO_INPUT}"
+            echo "KERNEL_DIR=$(pwd)"
+            echo "KERNEL_BRANCH=${BRANCH_NAME}"
+            echo "KERNEL_COMMIT=${FULL_COMMIT:0:8}"
+            echo "KERNEL_COMMIT_URL=${COMMIT_URL}"
+            echo "DEFCONFIG=${INPUT_DEFCONFIG:-}"
+            echo "CONFIG_FRAGMENTS=${INPUT_FRAGMENTS:-}"
+          } >> "$GITHUB_ENV"
+
+          echo "KERNEL_VERSION=$(make kernelversion 2>/dev/null || echo 'unknown')" >> "$GITHUB_ENV"
+          echo "KERNEL_COMMIT_MSG=$(git log -1 --pretty=format:'%s')" >> "$GITHUB_ENV"
+          CI_SCRIPT_CLONE_KERNEL_EOF
+          cat > .ci-scripts/setup_toolchain.sh <<'CI_SCRIPT_SETUP_TOOLCHAIN_EOF'
+          #!/usr/bin/env bash
+          # Prepares the Clang toolchain selected by CLANG_TOOLCHAIN:
+          #   AOSP (cloned by the workflow) | Neutron | Greenforce | WeebX | ZyC
+          # GF_CLANG_VERSION applies to Greenforce / ZyC / WeebX (see the list_tags input).
+          set -euo pipefail
+          source "$(dirname "$0")/common.sh"
+
+          TOOLCHAIN="$(echo "${CLANG_TOOLCHAIN:-AOSP}" | tr '[:upper:]' '[:lower:]')"
+          GF_CLANG_VERSION="${GF_CLANG_VERSION:-latest}"
+          TC_ROOT="${HOME}/toolchains"
+          CLANG_TAG=""
+
+          # ── helpers ────────────────────────────────────────────────────────────────
+
+          # Download <url>, extract, locate bin/clang and move that toolchain root to <dest>.
+          fetch_clang_archive() {
+            local url="$1" dest="$2" tag="$3" tmp bin
+            log_info "Downloading: ${url}"
+            tmp=$(mktemp -d)
+            wget -q -O "${tmp}/clang.tar" "${url}" || { rm -rf "${tmp}"; log_error "Download failed (wrong tag, or asset removed from Releases?)."; return 1; }
+            mkdir -p "${tmp}/x"
+            tar -xf "${tmp}/clang.tar" -C "${tmp}/x" || { rm -rf "${tmp}"; log_error "Extract failed (.tar.zst needs zstd)."; return 1; }
+            bin=$(find "${tmp}/x" -maxdepth 5 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)
+            if [ -z "${bin}" ]; then
+              log_error "bin/clang not found in archive. Top-level contents:"
+              ls -la "${tmp}/x" | sed 's/^/    /'
+              rm -rf "${tmp}"; return 1
+            fi
+            rm -rf "${dest}"; mkdir -p "$(dirname "${dest}")"
+            mv "$(dirname "$(dirname "${bin}")")" "${dest}"
+            echo "${tag}" > "${dest}/.gf_tag"
+            rm -rf "${tmp}"
+          }
+
+          # Greenforce: "<tag>\t<clang major>\t<asset url>", newest first
+          GF_API="https://api.github.com/repos/greenforce-project/greenforce_clang/releases"
+          GF_FALLBACK_TAG="20072024"; GF_FALLBACK_MAJOR="19"
+          GF_FALLBACK_URL="https://github.com/greenforce-project/greenforce_clang/releases/download/20072024/greenforce-clang-19.0.0git-20072024.tar.zst"
+
+          gf_list() {
+            local page out auth=()
+            [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+            for page in 1 2 3; do
+              out=$(curl -fsSL "${auth[@]}" "${GF_API}?per_page=100&page=${page}" | python3 -c '
+          import sys, json, re
+          for r in json.load(sys.stdin):
+              if r.get("draft"):
+                  continue
+              for a in r.get("assets", []):
+                  n = a["name"]
+                  if not n.endswith((".tar.gz", ".tar.zst", ".tar.xz")):
+                      continue
+                  m = re.search(r"clang-(\d+)\.\d+\.\d+", n, re.I)
+                  print(r["tag_name"], m.group(1) if m else "?", a["browser_download_url"], sep="\t")
+                  break
+          ') || break
+              [ -z "${out}" ] && break
+              printf '%s\n' "${out}"
+            done
+          }
+
+          download_greenforce() {
+            local list line tag major url
+            list=$(gf_list || true)
+            if [ -z "${list}" ]; then
+              if [ "${GF_CLANG_VERSION}" = "latest" ]; then
+                log_warn "Could not fetch the Greenforce release list; using fallback ${GF_FALLBACK_TAG} (clang ${GF_FALLBACK_MAJOR})."
+                tag="${GF_FALLBACK_TAG}"; major="${GF_FALLBACK_MAJOR}"; url="${GF_FALLBACK_URL}"
+              else
+                log_error "Could not fetch the Greenforce release list (network / GitHub rate limit?)."; return 1
+              fi
+            else
+              case "${GF_CLANG_VERSION}" in
+                latest)            line=$(head -n1 <<<"${list}") ;;
+                [0-9]|[0-9][0-9])  line=$(awk -F'\t' -v v="${GF_CLANG_VERSION}" '$2==v{print; exit}' <<<"${list}") ;;
+                *)                 line=$(awk -F'\t' -v v="${GF_CLANG_VERSION}" '$1==v{print; exit}' <<<"${list}") ;;
+              esac
+              if [ -z "${line}" ]; then
+                log_error "clang_version '${GF_CLANG_VERSION}' not found for Greenforce. Available majors:"
+                awk -F'\t' '!seen[$2]++{printf "    clang %s\n",$2}' <<<"${list}"
+                return 1
+              fi
+              IFS=$'\t' read -r tag major url <<<"${line}"
+            fi
+            log_info "Greenforce Clang ${major} (tag ${tag})"
+            fetch_clang_archive "${url}" "${CLANG_DIR}" "${tag}"
+          }
+
+          download_zyc() {
+            local raw="https://raw.githubusercontent.com/ZyCromerZ/Clang/main"
+            local rel="https://github.com/ZyCromerZ/Clang/releases/download" url="" t
+            case "${GF_CLANG_VERSION}" in
+              latest|main)       url=$(curl -fsSL "${raw}/Clang-main-link.txt" | tr -d '[:space:]') ;;
+              [0-9]|[0-9][0-9])  url=$(curl -fsSL "${raw}/Clang-${GF_CLANG_VERSION}-link.txt" | tr -d '[:space:]') ;;
+              *)                 t="${GF_CLANG_VERSION%-release}"; url="${rel}/${t}-release/Clang-${t}.tar.gz" ;;
+            esac
+            [ -n "${url}" ] || { log_error "ZyC version '${GF_CLANG_VERSION}' not found. Use: latest | 10-16 | tag (e.g. 23.0.0git-20260130-release)."; return 1; }
+            CLANG_TAG_NEW=$(basename "$(dirname "${url}")")
+            log_info "ZyC Clang (tag ${CLANG_TAG_NEW})"
+            fetch_clang_archive "${url}" "${CLANG_DIR}" "${CLANG_TAG_NEW}"
+          }
+
+          download_weebx() {
+            local raw="https://raw.githubusercontent.com/XSans0/WeebX-Clang/main"
+            local rel="https://github.com/XSans0/WeebX-Clang/releases/download" url="" tag
+            case "${GF_CLANG_VERSION}" in
+              latest)            url=$(curl -fsSL "${raw}/main/link.txt" | tr -d '[:space:]') ;;
+              [0-9]|[0-9][0-9])  url=$(curl -fsSL "${raw}/release/${GF_CLANG_VERSION}.x/link.txt" | tr -d '[:space:]') ;;
+              *)                 tag="${GF_CLANG_VERSION}"; url="${rel}/${tag}/${tag%-release}.tar.gz" ;;
+            esac
+            [ -n "${url}" ] || { log_error "WeebX version '${GF_CLANG_VERSION}' not found. Use: latest | 16 | 17 | 18 | 19 | tag (e.g. WeebX-Clang-19.1.5-release)."; return 1; }
+            CLANG_TAG_NEW=$(basename "$(dirname "${url}")")
+            log_info "WeebX Clang (tag ${CLANG_TAG_NEW})"
+            fetch_clang_archive "${url}" "${CLANG_DIR}" "${CLANG_TAG_NEW}"
+          }
+
+          # ld.lld & friends often need libxml2.so.2 / libtinfo.so.5. If a differently-versioned
+          # library exists, symlink it into <clang>/lib; fail early if a binary still cannot run.
+          fix_clang_libs() {
+            local b missing="" m base cand out
+            export LD_LIBRARY_PATH="${CLANG_DIR}/lib:${LD_LIBRARY_PATH:-}"
+            for b in ld.lld clang llvm-ar llvm-nm llvm-objcopy; do
+              [ -x "${CLANG_DIR}/bin/${b}" ] || continue
+              missing+=$'\n'$(ldd "${CLANG_DIR}/bin/${b}" 2>/dev/null | awk '/not found/{print $1}')
+            done
+            missing=$(printf '%s\n' "${missing}" | sed '/^$/d' | sort -u)
+            [ -z "${missing}" ] && return 0
+            log_warn "Missing toolchain libraries: $(echo "${missing}" | tr '\n' ' ')"
+            if grep -q '^libxml2' <<<"${missing}"; then
+              sudo apt-get install -y --no-install-recommends libxml2 >/dev/null 2>&1 \
+                || sudo apt-get install -y --no-install-recommends libxml2-16 >/dev/null 2>&1 || true
+            fi
+            mkdir -p "${CLANG_DIR}/lib"
+            for m in ${missing}; do
+              ldconfig -p 2>/dev/null | grep -qF "${m} " && continue
+              base="${m%%.so*}"
+              cand=$(ldconfig -p 2>/dev/null | awk -v b="${base}.so" 'index($1,b)==1{print $NF}' | head -n1)
+              [ -z "${cand}" ] && cand=$(ls /usr/lib/x86_64-linux-gnu/${base}.so.* /lib/x86_64-linux-gnu/${base}.so.* 2>/dev/null | head -n1 || true)
+              if [ -n "${cand}" ]; then
+                ln -sf "${cand}" "${CLANG_DIR}/lib/${m}"
+                log_info "Symlink ${m} -> ${cand}"
+              fi
+            done
+            for b in ld.lld clang; do
+              [ -x "${CLANG_DIR}/bin/${b}" ] || continue
+              if ! out=$("${CLANG_DIR}/bin/${b}" --version 2>&1); then
+                log_error "${b} still fails to run:"; echo "${out}" | head -n3 | sed 's/^/    /'
+                exit 1
+              fi
+            done
+          }
+
+          # ── toolchain selection ────────────────────────────────────────────────────
+          case "${TOOLCHAIN}" in
+            aosp)
+              echo "=== Using AOSP Clang ==="
+              CLANG_DIR="${GITHUB_WORKSPACE}/clang"
+              if [ ! -x "${CLANG_DIR}/bin/clang" ]; then
+                log_error "AOSP Clang not found at ${CLANG_DIR}/bin"; exit 1
+              fi
+              ;;
+
+            neutron)
+              echo "=== Installing Neutron Clang ==="
+              CLANG_DIR="${TC_ROOT}/neutron-clang"
+              mkdir -p "${CLANG_DIR}"; cd "${CLANG_DIR}"
+              if [ ! -x "${CLANG_DIR}/antman" ]; then
+                curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+                chmod +x antman
+              fi
+              ./antman -S
+              [ -x "${CLANG_DIR}/bin/clang" ] || { log_error "Neutron Clang not found at ${CLANG_DIR}/bin"; exit 1; }
+              ;;
+
+            greenforce|zyc|weebx)
+              CLANG_DIR="${TC_ROOT}/clang-${TOOLCHAIN}-${GF_CLANG_VERSION//\//_}"
+              echo "=== Installing ${TOOLCHAIN} Clang (${GF_CLANG_VERSION}) ==="
+              CLANG_TAG_NEW=""
+              case "${TOOLCHAIN}" in
+                greenforce) download_greenforce ;;
+                zyc)        download_zyc ;;
+                weebx)      download_weebx ;;
+              esac || { log_error "Failed to prepare ${TOOLCHAIN} Clang."; exit 1; }
+              [ -x "${CLANG_DIR}/bin/clang" ] || { log_error "clang not found in ${CLANG_DIR}/bin."; exit 1; }
+              ;;
+
+            *)
+              log_error "Unknown Clang toolchain: ${TOOLCHAIN}"; exit 1 ;;
+          esac
+
+          CLANG_PATH="${CLANG_DIR}/bin"
+          [ -f "${CLANG_DIR}/.gf_tag" ] && CLANG_TAG="$(cat "${CLANG_DIR}/.gf_tag")"
+          [ "${TOOLCHAIN}" != "aosp" ] && fix_clang_libs
+
+          echo "Selected toolchain: ${TOOLCHAIN}"
+          echo "Clang path: ${CLANG_PATH}"
+
+          {
+            echo "CLANG_PATH=${CLANG_PATH}"
+            echo "CLANG_DIR=${CLANG_DIR}"
+            echo "CLANG_TAG=${CLANG_TAG}"
+          } >> "${GITHUB_ENV}"
+          echo "${CLANG_PATH}" >> "${GITHUB_PATH}"
+
+          "${CLANG_PATH}/clang" --version
+          CI_SCRIPT_SETUP_TOOLCHAIN_EOF
+          cat > .ci-scripts/patch_kernel.sh <<'CI_SCRIPT_PATCH_KERNEL_EOF'
+          #!/usr/bin/env bash
+          # Source-level patches applied to the cloned kernel (all idempotent):
+          #   swappiness, VM tuning, DTB-only Image.gz-dtb, zram compressor, zram minimum size.
+          # Toggles come from resolve_options.sh (SWAPPINESS_PATCH, VM_TUNE, LOWRAM, ZRAM_MIN_PERCENT, ...).
+          set -uo pipefail
+          source "$(dirname "$0")/common.sh"
+          cd "${KERNEL_DIR}" || exit 1
+
+          DTB_ONLY="${DTB_ONLY:-1}"
+          VM_PAGE_CLUSTER="${VM_PAGE_CLUSTER:-0}"
+          VM_WATERMARK_SCALE="${VM_WATERMARK_SCALE:-30}"
+
+          # ── swappiness (max 100 -> 200, default value, optional lock) ──────────────
+          patch_swappiness() {
+            [ "${SWAPPINESS_PATCH:-0}" = "1" ] || return 0
+            log_info "Patch swappiness: max 200, default ${SWAPPINESS_DEFAULT}, lock=${SWAPPINESS_LOCK}"
+            python3 - "${KERNEL_DIR}" "${SWAPPINESS_DEFAULT}" "${SWAPPINESS_LOCK}" <<'PY' 2>&1 | tee -a "${BUILD_LOG}"
+          import re, sys
+          root, default, lock = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+          failed = False
+
+          def edit(path, fn, label):
+              global failed
+              f = f"{root}/{path}"
+              src = open(f).read()
+              out, msg = fn(src)
+              if out is None:
+                  print(f"[ERROR] {path}: {label} -> pattern not found (different source?)")
+                  failed = True
+                  return
+              if out != src:
+                  open(f, "w").write(out)
+              print(f"[PATCH] {path}: {label} ({msg})")
+
+          # kernel/sysctl.c : limit 200 (+ mode 0444 when locked)
+          def sysctl(src):
+              if "static int two_hundred" not in src:
+                  src, n = re.subn(r"(static int one_hundred = 100;\n)", r"\1static int two_hundred = 200;\n", src, count=1)
+                  if n == 0:
+                      return None, ""
+              m = re.search(r'\{\s*\.procname\s*=\s*"swappiness",.*?\n\t\},', src, re.S)
+              if not m:
+                  return None, ""
+              blk = m.group(0)
+              new = blk.replace("&one_hundred", "&two_hundred")
+              if lock:
+                  new = re.sub(r"\.mode(\s*)= 0[0-7]{3}", r".mode\1= 0444", new, count=1)
+              return src.replace(blk, new, 1), ("max=200, mode=" + ("0444" if lock else "unchanged"))
+          edit("kernel/sysctl.c", sysctl, "sysctl vm.swappiness")
+
+          # mm/memcontrol.c : limit 200 (+ ignore writes to the root cgroup when locked)
+          def memcg(src):
+              m = re.search(r"static int mem_cgroup_swappiness_write\(.*?\n\}\n", src, re.S)
+              if not m:
+                  return None, ""
+              fn = m.group(0)
+              new = fn.replace("if (val > 100)", "if (val > 200)")
+              if lock:
+                  new = re.sub(
+                      r"\tif \(css->parent\)\n\t\tmemcg->swappiness = val;\n\telse\n\t\tvm_swappiness = val;\n",
+                      "\tif (css->parent)\n\t\tmemcg->swappiness = val;\n"
+                      "\t/* root cgroup: global value is locked, write ignored but reported as success */\n",
+                      new)
+                  if "vm_swappiness = val" in new:
+                      return None, ""
+              return src.replace(fn, new, 1), "max=200" + (", root ignored" if lock else "")
+          edit("mm/memcontrol.c", memcg, "memory.swappiness")
+
+          # mm/vmscan.c : default value
+          def vmscan(src):
+              new, n = re.subn(r"int vm_swappiness = \d+;", f"int vm_swappiness = {default};", src, count=1)
+              return (new, f"default={default}") if n else (None, "")
+          edit("mm/vmscan.c", vmscan, "vm_swappiness default")
+
+          sys.exit(1 if failed else 0)
+          PY
+            [ "${PIPESTATUS[0]}" -eq 0 ] || { log_error "Swappiness patch failed, stopping the build."; exit 1; }
+          }
+
+          # ── VM defaults for zram + gaming ──────────────────────────────────────────
+          patch_vm_tuning() {
+            [ "${VM_TUNE:-0}" = "1" ] || return 0
+            local v
+            for v in "${VM_PAGE_CLUSTER}:0:6:VM_PAGE_CLUSTER" "${VM_WATERMARK_SCALE}:1:1000:VM_WATERMARK_SCALE"; do
+              local val="${v%%:*}" rest="${v#*:}"
+              local lo="${rest%%:*}"; rest="${rest#*:}"
+              local hi="${rest%%:*}" name="${rest#*:}"
+              if ! [[ "${val}" =~ ^[0-9]+$ ]] || [ "${val}" -lt "${lo}" ] || [ "${val}" -gt "${hi}" ]; then
+                log_error "${name} must be ${lo}-${hi} (got '${val}')"; exit 1
+              fi
+            done
+            local swp="${KERNEL_DIR}/mm/swap.c" pga="${KERNEL_DIR}/mm/page_alloc.c"
+            if grep -qE '^[[:space:]]+page_cluster = [0-9]+;' "${swp}" && grep -qE '^int watermark_scale_factor = [0-9]+;' "${pga}"; then
+              sed -i -E "s/^([[:space:]]+page_cluster = )[0-9]+;/\1${VM_PAGE_CLUSTER};/" "${swp}"
+              sed -i -E "s/^(int watermark_scale_factor = )[0-9]+;/\1${VM_WATERMARK_SCALE};/" "${pga}"
+              log_info "VM tuning: page-cluster=${VM_PAGE_CLUSTER}, watermark_scale_factor=${VM_WATERMARK_SCALE}"
+            else
+              log_warn "VM code pattern (swap.c / page_alloc.c) not recognised, VM tuning skipped."
+            fi
+          }
+
+          # ── Image.gz-dtb with only the main DTB (4.19 Makefile also appends .dtbo overlays) ──
+          patch_dtb_append() {
+            [ "${DTB_ONLY}" = "1" ] || return 0
+            [ -f "${KERNEL_DIR}/arch/arm64/boot/Makefile" ] || return 0
+            python3 - "${KERNEL_DIR}/arch/arm64/boot/Makefile" <<'PY' 2>&1 | tee -a "${BUILD_LOG}"
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          obj = "DTB_OBJS := $(addprefix $(obj)/dts/,$(DTB_LIST))\n"
+          i_obj = s.find(obj)
+          i_dtbo = s.find("DTBO_NAMES :=")
+          if i_obj < 0 or i_dtbo < 0:
+              print("[PATCH] arch/arm64/boot/Makefile: pattern not recognised, skipped")
+              sys.exit(0)
+          if i_obj < i_dtbo:
+              print("[PATCH] arch/arm64/boot/Makefile: already main-DTB only, no change")
+              sys.exit(0)
+          s = s.replace(obj, "", 1)
+          s = s.replace("DTBO_NAMES :=", obj + "\nDTBO_NAMES :=", 1)
+          open(p, "w").write(s)
+          print("[PATCH] arch/arm64/boot/Makefile: Image.gz-dtb holds only the main DTB (overlays not appended)")
+          PY
+          }
+
+          # ── zram default compressor (4.19: hard-coded in zram_drv.c, 4.14: Kconfig ZRAM_DEF_COMP_*) ──
+          patch_zram_compressor() {
+            [ "${LOWRAM:-0}" = "1" ] || return 0
+            case "${ZRAM_COMP}" in
+              lzo|lzo-rle|lz4|lz4hc|zstd) ;;
+              *) log_error "Invalid zram compressor: '${ZRAM_COMP}' (lzo lzo-rle lz4 lz4hc zstd)"; exit 1 ;;
+            esac
+            local f="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
+            local k="${KERNEL_DIR}/drivers/block/zram/Kconfig"
+            local mode
+            if grep -qE 'static const char \*default_compressor = "[^"]*";' "${f}" 2>/dev/null; then
+              sed -i -E "s|(static const char \*default_compressor = )\"[^\"]*\";|\1\"${ZRAM_COMP}\";|" "${f}"
+              mode="source"; log_info "Default zram compressor (source): ${ZRAM_COMP}"
+            elif grep -q 'config ZRAM_DEF_COMP_LZ4' "${k}" 2>/dev/null; then
+              mode="kconfig"; log_info "Default zram compressor (Kconfig): ${ZRAM_COMP}"
+            else
+              mode="none"; log_warn "default_compressor pattern not recognised, zram compressor unchanged."
+            fi
+            set_env ZRAM_COMP_MODE "${mode}"
+          }
+
+          # ── zram minimum size, % of RAM ────────────────────────────────────────────
+          patch_zram_size() {
+            [ "${ZRAM_MIN_PERCENT:-0}" = "0" ] && return 0
+            local f="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
+            [ -f "${f}" ] || { log_warn "zram_drv.c not found, zram size unchanged."; return 0; }
+            python3 - "${f}" "${ZRAM_MIN_PERCENT}" <<'PY' 2>&1 | tee -a "${BUILD_LOG}"
+          import re, sys
+          p, pct = sys.argv[1], sys.argv[2]
+          s = open(p).read()
+          define = f"#define NEKO_ZRAM_MIN_PCT {pct}\n"
+          if "NEKO_ZRAM_MIN_PCT" in s:
+              open(p, "w").write(re.sub(r"#define NEKO_ZRAM_MIN_PCT \d+\n", define, s, count=1))
+              print(f"[PATCH] zram_drv.c: minimum zram size updated -> {pct}% RAM (already patched)")
+              sys.exit(0)
+          inc = '#include "zram_drv.h"\n'
+          m = re.search(r"(\tdisksize = memparse\(buf, NULL\);\n\tif \(!disksize\)\n\t\treturn -EINVAL;\n)", s)
+          if inc not in s or not m:
+              print("[WARN] zram_drv.c: disksize_store pattern not recognised, zram size unchanged")
+              sys.exit(3)
+          block = (
+              "\n\t/* NEKO: minimum zram size = NEKO_ZRAM_MIN_PCT% of RAM (userspace may ask for more) */\n"
+              "\t{\n"
+              "\t\tstruct sysinfo neko_si;\n"
+              "\t\tu64 neko_min;\n\n"
+              "\t\tsi_meminfo(&neko_si);\n"
+              "\t\tneko_min = (u64)neko_si.totalram * neko_si.mem_unit / 100 * NEKO_ZRAM_MIN_PCT;\n"
+              "\t\tif (disksize < neko_min)\n"
+              "\t\t\tdisksize = neko_min;\n"
+              "\t}\n"
+          )
+          s = s.replace(inc, inc + define, 1)
+          s = s.replace(m.group(1), m.group(1) + block, 1)
+          open(p, "w").write(s)
+          print(f"[PATCH] zram_drv.c: minimum zram size = {pct}% of RAM")
+          PY
+            [ "${PIPESTATUS[0]}" -eq 0 ] || log_warn "zram size patch skipped (see message above)."
+          }
+
+          patch_swappiness
+          patch_vm_tuning
+          patch_dtb_append
+          patch_zram_compressor
+          patch_zram_size
+          log_success "Source patches done."
+          CI_SCRIPT_PATCH_KERNEL_EOF
+          cat > .ci-scripts/setup_nomount.sh <<'CI_SCRIPT_SETUP_NOMOUNT_EOF'
+          #!/usr/bin/env bash
+          # Integrates NoMount (VFS path redirection, https://github.com/maxsteeel/nomount) into the kernel source
+          # (equivalent to NoMount's own kernel/setup.sh, without "curl | bash").
+          # CONFIG_NOMOUNT itself is switched on later in build_kernel.sh.
+          set -uo pipefail
+          source "$(dirname "$0")/common.sh"
+
+          [ "${NOMOUNT:-0}" = "1" ] || { log_info "NoMount: disabled."; exit 0; }
+
+          NOMOUNT_REPO="${NOMOUNT_REPO:-https://github.com/maxsteeel/nomount.git}"
+          NOMOUNT_REF="${NOMOUNT_REF:-dev}"
+          nm="${KERNEL_DIR}/NoMount"; fs="${KERNEL_DIR}/fs"
+
+          [ -d "${fs}" ] || { log_error "fs/ directory not found in ${KERNEL_DIR}"; exit 1; }
+
+          log_info "NoMount: preparing (${NOMOUNT_REF})..."
+          rm -rf "${nm}"
+          git clone -q "${NOMOUNT_REPO}" "${nm}" || { log_error "Failed to clone NoMount (${NOMOUNT_REPO})."; exit 1; }
+          if git -C "${nm}" rev-parse --verify -q "origin/${NOMOUNT_REF}" >/dev/null; then
+            git -C "${nm}" checkout -q -f --detach "origin/${NOMOUNT_REF}"
+          else
+            git -C "${nm}" checkout -q -f "${NOMOUNT_REF}" || { log_error "NoMount: ref '${NOMOUNT_REF}' not found."; exit 1; }
+          fi
+          [ -f "${nm}/kernel/src/nomount.c" ] || { log_error "NoMount: kernel/src/nomount.c missing."; exit 1; }
+
+          ln -sfn ../NoMount/kernel/src "${fs}/nomount"
+          if ! grep -q "nomount" "${fs}/Makefile"; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "${fs}/Makefile"
+          fi
+          if ! grep -q 'source "fs/nomount/Kconfig"' "${fs}/Kconfig"; then
+            awk '
+              /^endmenu/ { last = NR }
+              { lines[NR] = $0 }
+              END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print lines[i] } }
+            ' "${fs}/Kconfig" > "${fs}/Kconfig.tmp" && mv "${fs}/Kconfig.tmp" "${fs}/Kconfig"
+          fi
+          grep -q 'source "fs/nomount/Kconfig"' "${fs}/Kconfig" || { log_error "NoMount: failed to patch fs/Kconfig."; exit 1; }
+
+          log_success "NoMount: $(git -C "${nm}" log -1 --format='%h %s')"
+          set_env NOMOUNT_COMMIT "$(git -C "${nm}" rev-parse --short HEAD)"
+          CI_SCRIPT_SETUP_NOMOUNT_EOF
+          cat > .ci-scripts/setup_ksu.sh <<'CI_SCRIPT_SETUP_KSU_EOF'
+          #!/usr/bin/env bash
+          set -e
+          source "$(dirname "$0")/common.sh"
+          cd "${KERNEL_DIR}"
+
+          # ── Stock fallback ──────────────────────────────────────────────────────────
+          if [ "${ENABLE_KSU}" != "true" ]; then
+            {
+              echo "KSU_VARIANT=Stock"
+              echo "SUSFS_ENABLED=false"
+              echo "BUILD_VARIANT=Normal"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # ── Variants ────────────────────────────────────────────────────────────────
+          case "${KSU_VARIANT_INPUT}" in
+            xxKSU)
+              curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -s master
+              KSU_BRANCH="master"; SUSFS="false"
+              KSU_REPO="https://github.com/backslashxx/KernelSU"
+              if [ "${ENABLE_SUSFS}" == "true" ]; then
+                echo "::warning::xxKSU does not support SUSFS — flag ignored."
+              fi
+              ;;
+            SukiSU)
+              if [ "${ENABLE_SUSFS}" == "true" ]; then
+                curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+                KSU_BRANCH="main"; SUSFS="true"
+              else
+                curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+                KSU_BRANCH="builtin"; SUSFS="false"
+              fi
+              KSU_REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra"
+              ;;
+            BakaSU)
+              curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
+              KSU_BRANCH="main"
+              KSU_REPO="https://github.com/Baka-SU/BakaSU"
+              SUSFS="${ENABLE_SUSFS}"
+              ;;
+            *)
+              log_error "Unknown KernelSU variant: '${KSU_VARIANT_INPUT}'"; exit 1
+              ;;
+          esac
+
+          if [ "${SUSFS}" == "true" ]; then
+            BUILD_VARIANT="KernelSU + SUSFS"
+          else
+            BUILD_VARIANT="KernelSU"
+          fi
+
+          {
+            echo "KSU_VARIANT=${KSU_VARIANT_INPUT}"
+            echo "KSU_BRANCH=${KSU_BRANCH}"
+            echo "KSU_REPO=${KSU_REPO}"
+            echo "SUSFS_ENABLED=${SUSFS}"
+            echo "BUILD_VARIANT=${BUILD_VARIANT}"
+          } >> "$GITHUB_ENV"
+          CI_SCRIPT_SETUP_KSU_EOF
+          cat > .ci-scripts/build_kernel.sh <<'CI_SCRIPT_BUILD_KERNEL_EOF'
+          #!/usr/bin/env bash
+          set -eo pipefail
+          source "$(dirname "$0")/common.sh"
+          cd "${KERNEL_DIR}"
+
+          start_time=$(date +%s)
+          OUT_DIR="${KERNEL_DIR}/out"
+          SC="${KERNEL_DIR}/scripts/config"
+          JOBS=$(nproc --all)
+
+          export PATH="${CLANG_PATH}:${PATH}"
+          export ARCH="${ARCH:-arm64}"
+          export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-elohim-etz}"
+          export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-GitHub-Actions}"
+
+          # Always extract the error lines, even when the build dies half-way
+          extract_errors() {
+            grep -i -E "error:|undefined reference|fatal error|\[ERROR\]" "${BUILD_LOG}" > "${ERROR_LOG}" 2>/dev/null || true
+          }
+          trap extract_errors EXIT
+
+          echo "=== Toolchain ==="
+          echo "Type: ${CLANG_TOOLCHAIN}${CLANG_TAG:+ (tag ${CLANG_TAG})}"
+          echo "Path: ${CLANG_PATH}"
+          "${CLANG_PATH}/clang" --version | head -n 1
+
+          mkdir -p "${OUT_DIR}"
+
+          CC_CMD="clang"
+          command -v ccache &>/dev/null && CC_CMD="ccache clang"
+          MAKE_ARGS=(
+            -j"${JOBS}"
+            O="${OUT_DIR}"
+            ARCH="${ARCH}"
+            CC="${CC_CMD}"
+            LLVM=1
+            LLVM_IAS=1
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CONFIG_NO_ERROR_ON_MISMATCH=y
+          )
+
+          # ── defconfig (auto-detect when left empty) ─────────────────────────────────
+          detect_defconfig() {
+            local cfg="${KERNEL_DIR}/arch/${ARCH}/configs"
+            if   [ -f "${cfg}/k85v1_64_k419_defconfig" ] && [ -f "${cfg}/vendor/nemo.config" ]; then
+              DEFCONFIG="k85v1_64_k419_defconfig vendor/nemo.config"
+            elif [ -f "${cfg}/RM6785_defconfig" ]; then DEFCONFIG="RM6785_defconfig"
+            elif [ -f "${cfg}/nemo_defconfig" ];   then DEFCONFIG="nemo_defconfig"
+            elif [ -f "${cfg}/gki_defconfig" ] && [ -f "${cfg}/vendor/nemo.config" ]; then
+              DEFCONFIG="gki_defconfig vendor/nemo.config"
+            else
+              log_error "defconfig is empty and none could be auto-detected. Similar files:"
+              (cd "${cfg}" && ls -d *6785* *nemo* vendor/*nemo* 2>/dev/null | sed 's/^/    /') || true
+              exit 1
+            fi
+            log_info "defconfig auto-detected: ${DEFCONFIG}"
+          }
+          [ -n "${DEFCONFIG}" ] || detect_defconfig
+          read -r -a DEFCONFIG_LIST <<< "${DEFCONFIG}"
+
+          echo "=== Generating defconfig: ${DEFCONFIG} ===" | tee -a "$BUILD_LOG"
+          make "${MAKE_ARGS[@]}" "${DEFCONFIG_LIST[@]}" 2>&1 | tee -a "$BUILD_LOG"
+
+          # ── config fragments (ksu.config is appended when KernelSU is enabled) ──
+          FRAGMENTS="${CONFIG_FRAGMENTS}"
+          if [ "${ENABLE_KSU}" == "true" ]; then
+            if [ -n "${FRAGMENTS}" ]; then
+              FRAGMENTS="${FRAGMENTS} ksu.config"
+            else
+              FRAGMENTS="ksu.config"
+            fi
+          fi
+
+          if [ -n "${FRAGMENTS}" ]; then
+            echo "=== Merging config fragments: ${FRAGMENTS} ===" | tee -a "$BUILD_LOG"
+
+            read -r -a FRAGMENT_LIST <<< "${FRAGMENTS}"
+            MERGE_FILES=("${OUT_DIR}/.config")
+
+            for frag in "${FRAGMENT_LIST[@]}"; do
+              if [ -f "${frag}" ]; then
+                frag_path="${frag}"
+              elif [ -f "arch/${ARCH}/configs/${frag}" ]; then
+                frag_path="arch/${ARCH}/configs/${frag}"
+              else
+                echo "ERROR: config fragment '${frag}' not found in ./ or arch/${ARCH}/configs/" | tee -a "$BUILD_LOG"
+                exit 1
+              fi
+              echo "  + ${frag_path}" | tee -a "$BUILD_LOG"
+              MERGE_FILES+=("${frag_path}")
+            done
+
+            if [ -f scripts/kconfig/merge_config.sh ]; then
+              bash scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" "${MERGE_FILES[@]}" 2>&1 | tee -a "$BUILD_LOG"
+            else
+              # Fallback: plain concatenation (later entries win after olddefconfig)
+              cat "${MERGE_FILES[@]}" > "${OUT_DIR}/.config.tmp"
+              mv "${OUT_DIR}/.config.tmp" "${OUT_DIR}/.config"
+            fi
+
+            make "${MAKE_ARGS[@]}" olddefconfig 2>&1 | tee -a "$BUILD_LOG"
+          fi
+
+          olddefconfig() {
+            make "${MAKE_ARGS[@]}" olddefconfig >> "${BUILD_LOG}" 2>&1 || { log_error "olddefconfig failed."; exit 1; }
+          }
+
+          # ── a merged config missing the platform symbol fails hours later; stop now ──
+          # EXPECT_MTK_PLATFORM=""  -> skip the check (non-MediaTek kernels)
+          verify_config() {
+            local c="${OUT_DIR}/.config" bad=0 want="${EXPECT_MTK_PLATFORM-mt6785}"
+            if [ -n "${want}" ]; then
+              grep -q "^CONFIG_MTK_PLATFORM=\"${want}\"" "$c" || {
+                log_error "CONFIG_MTK_PLATFORM is not \"${want}\" -> incomplete configuration."; bad=1; }
+              grep -q '^CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE=y' "$c" || \
+                log_warn "APPENDED_DTB_IMAGE is off; the output may not be Image.gz-dtb."
+              grep -q "mediatek/${want}" "$c" || log_warn "DTB ${want} is not listed in .config."
+            fi
+            if [ "${bad}" -eq 1 ]; then
+              echo "  Configs used: ${DEFCONFIG} ${CONFIG_FRAGMENTS}" | tee -a "${BUILD_LOG}"
+              echo "  Check defconfig / fragments in the kernel repo (README, build.config*, arch/arm64/configs/)." | tee -a "${BUILD_LOG}"
+              [ "${ALLOW_BAD_CONFIG:-0}" = "1" ] || exit 1
+            fi
+          }
+
+          # ── LOCALVERSION (uname -r). Empty input = leave the kernel's own string ────
+          apply_localversion() {
+            [ -n "${LOCALVERSION_SUFFIX:-}" ] || return 0
+            if [ "${REMOVE_LOCALVERSION_FILES:-1}" = "1" ]; then
+              local f
+              for f in "${KERNEL_DIR}"/localversion*; do
+                [ -f "${f}" ] || continue
+                log_info "Removing $(basename "${f}") ($(cat "${f}"))"
+                rm -f "${f}"
+              done
+            fi
+            log_info "LOCALVERSION = \"${LOCALVERSION_SUFFIX}\""
+            bash "${SC}" --file "${OUT_DIR}/.config" --set-str LOCALVERSION "${LOCALVERSION_SUFFIX}"
+            if [ "${DISABLE_LOCALVERSION_AUTO:-1}" = "1" ]; then
+              bash "${SC}" --file "${OUT_DIR}/.config" -d LOCALVERSION_AUTO
+              : > "${KERNEL_DIR}/.scmversion"   # empty -> no "+" / -dirty / -g<hash> suffix
+            fi
+            olddefconfig
+          }
+
+          # ── low-RAM mode (applied to out/.config, defconfig files untouched) ────────
+          apply_lowram_config() {
+            [ "${LOWRAM:-0}" = "1" ] || return 0
+            local cfg="${OUT_DIR}/.config" cur_shift sym opt opts="DEBUG_INFO"
+            cur_shift=$(sed -n 's/^CONFIG_LOG_BUF_SHIFT=//p' "${cfg}")
+            if [ "${LOWRAM_AGGRESSIVE:-0}" = "1" ]; then
+              log_info "Low-RAM mode (aggressive): DEBUG_INFO/SCHEDSTATS/KPROBES off, log buffer max 128 KB"
+              bash "${SC}" --file "${cfg}" -d DEBUG_INFO -d SCHEDSTATS -d KPROBES
+              opts="DEBUG_INFO SCHEDSTATS KPROBES"
+            else
+              log_info "Low-RAM mode: only DEBUG_INFO off (SCHEDSTATS/KPROBES untouched), log buffer max 128 KB"
+              bash "${SC}" --file "${cfg}" -d DEBUG_INFO
+            fi
+            # the log buffer is only ever shrunk
+            if [ -z "${cur_shift}" ] || [ "${cur_shift}" -gt 17 ]; then
+              bash "${SC}" --file "${cfg}" --set-val LOG_BUF_SHIFT 17
+            fi
+            # zram compressor via Kconfig (4.14) + make sure the crypto algorithm is built in
+            if [ "${ZRAM_COMP_MODE:-}" = "kconfig" ]; then
+              case "${ZRAM_COMP}" in
+                lzo-rle) sym=ZRAM_DEF_COMP_LZORLE ;;
+                lzo)     sym=ZRAM_DEF_COMP_LZO ;;
+                lz4)     sym=ZRAM_DEF_COMP_LZ4 ;;
+                lz4hc)   sym=ZRAM_DEF_COMP_LZ4HC ;;
+                zstd)    sym=ZRAM_DEF_COMP_ZSTD ;;
+              esac
+              bash "${SC}" --file "${cfg}" -e "${sym}"
+            fi
+            case "${ZRAM_COMP}" in
+              lz4)   bash "${SC}" --file "${cfg}" -e CRYPTO_LZ4 ;;
+              lz4hc) bash "${SC}" --file "${cfg}" -e CRYPTO_LZ4HC ;;
+              zstd)  bash "${SC}" --file "${cfg}" -e CRYPTO_ZSTD ;;
+            esac
+            olddefconfig
+            for opt in ${opts}; do
+              grep -q "^CONFIG_${opt}=y" "${cfg}" && log_warn "CONFIG_${opt} is still on (forced by another option)."
+            done
+            if [ "${ZRAM_COMP_MODE:-}" = "kconfig" ] && ! grep -q "^CONFIG_ZRAM_DEF_COMP=\"${ZRAM_COMP}\"" "${cfg}"; then
+              log_warn "zram compressor in .config is not '${ZRAM_COMP}': $(grep '^CONFIG_ZRAM_DEF_COMP=' "${cfg}")"
+            fi
+          }
+
+          # ── NoMount ─────────────────────────────────────────────────────────────────
+          apply_nomount_config() {
+            [ -e "${KERNEL_DIR}/fs/nomount" ] || return 0
+            bash "${SC}" --file "${OUT_DIR}/.config" -e NOMOUNT
+            olddefconfig
+            grep -q '^CONFIG_NOMOUNT=y' "${OUT_DIR}/.config" && log_info "CONFIG_NOMOUNT=y" || log_warn "CONFIG_NOMOUNT is not enabled in .config."
+            grep -q '^CONFIG_KEYS=y' "${OUT_DIR}/.config" || log_warn "CONFIG_KEYS is off: NoMount talks through the keyring and will not work."
+          }
+
+          # ── 32-bit vDSO needs a clang with an ARM target; some builds ship AArch64/x86 only ──
+          fix_compat_vdso() {
+            local mode="${DISABLE_COMPAT_VDSO:-auto}"
+            grep -q '^CONFIG_COMPAT_VDSO=y' "${OUT_DIR}/.config" || return 0
+            [ "${mode}" = "0" ] && return 0
+            if [ "${mode}" = "auto" ] && \
+               "${CLANG_PATH}/clang" --print-targets 2>/dev/null | grep -qE '^[[:space:]]+arm[[:space:]]'; then
+              return 0
+            fi
+            log_warn "This clang has no 32-bit ARM target -> CONFIG_COMPAT_VDSO disabled (32-bit apps still work; time calls go through syscalls)."
+            bash "${SC}" --file "${OUT_DIR}/.config" -d COMPAT_VDSO
+            olddefconfig
+          }
+
+          verify_config
+          apply_localversion
+          apply_lowram_config
+          apply_nomount_config
+          fix_compat_vdso
+
+          # arch/uapi headers first and serial, so they cannot race the parallel build
+          log_info "Preparing arch headers (serial)..."
+          make "${MAKE_ARGS[@]}" -j1 archheaders 2>&1 | tee -a "$BUILD_LOG"
+
+          echo "=== Starting kernel build (${JOBS} jobs) ===" | tee -a "$BUILD_LOG"
+          make "${MAKE_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+
+          [ -f "${OUT_DIR}/include/config/kernel.release" ] && \
+            log_info "Kernel version (uname -r): $(cat "${OUT_DIR}/include/config/kernel.release")"
+
+          BUILD_DURATION=$(( $(date +%s) - start_time ))
+          echo "BUILD_DURATION=${BUILD_DURATION}" >> "$GITHUB_ENV"
+
+          ccache --show-stats | tee -a "$BUILD_LOG"
+          CI_SCRIPT_BUILD_KERNEL_EOF
+          cat > .ci-scripts/check_output.sh <<'CI_SCRIPT_CHECK_OUTPUT_EOF'
+          #!/usr/bin/env bash
+          set -e
+          source "$(dirname "$0")/common.sh"
+          cd "${KERNEL_DIR}"
+
+          boot="out/arch/arm64/boot"
+
+          # Image.gz-dtb (DTB appended) is preferred when it exists; PREFER_DTB_IMAGE=0 forces plain Image.gz
+          if   [ "${PREFER_DTB_IMAGE:-1}" = "1" ] && [ -f "${boot}/Image.gz-dtb" ]; then KERNEL_IMG="${boot}/Image.gz-dtb"
+          elif [ -f "${boot}/Image.gz" ]; then KERNEL_IMG="${boot}/Image.gz"
+          elif [ -f "${boot}/Image.gz-dtb" ]; then KERNEL_IMG="${boot}/Image.gz-dtb"
+          elif [ -f "${boot}/Image" ];    then KERNEL_IMG="${boot}/Image"
+          else
+            log_error "No kernel image found in ${boot} — build failed. See: grep -iE 'error:' logs/errors.log"
+            exit 1
+          fi
+
+          IMAGE_SIZE_MB=$(echo "scale=2; $(stat -c%s "${KERNEL_IMG}") / 1048576" | bc)
+          {
+            echo "KERNEL_IMG=${KERNEL_DIR}/${KERNEL_IMG}"
+            echo "KERNEL_IMG_NAME=$(basename "${KERNEL_IMG}")"
+            echo "IMAGE_SIZE_MB=${IMAGE_SIZE_MB}"
+            echo "KERNEL_RELEASE=$(cat out/include/config/kernel.release 2>/dev/null || echo '?')"
+          } >> "$GITHUB_ENV"
+          log_success "$(basename "${KERNEL_IMG}") OK (${IMAGE_SIZE_MB} MB)"
+          CI_SCRIPT_CHECK_OUTPUT_EOF
+          cat > .ci-scripts/package_zip.sh <<'CI_SCRIPT_PACKAGE_ZIP_EOF'
+          #!/usr/bin/env bash
+          set -e
+          source "$(dirname "$0")/common.sh"
+
+          # AK_GENERATE=1 replaces the AnyKernel repo's anykernel.sh with a generated boot-only RM6785 one and
+          # inserts the NEKO banner. Meant for a plain osm0sis AnyKernel3 template. Default 0: the default
+          # elohim-etz/AnyKernel3 already ships its own RM6785 anykernel.sh + banner (a longer device list).
+          # Identity shown in recovery. Overridable from the workflow `env:` block.
+          AK_KERNEL_STRING="${AK_KERNEL_STRING:-Neko Kernel}"
+          AK_AUTHOR="${AK_AUTHOR:-KitsuNeko}"
+          # Models allowed to flash (do.devicecheck=1), space separated
+          AK_DEVICES="${AK_DEVICES:-RMX2151 rmx2151 RMX2161 rmx2161 RMX2001 rmx2001 RMX2002 rmx2002 RMX2002L1 rmx2002L1 RMX2001L1 rmx2001L1 RMX2003 RMX2153 RMX2153L1 RMX2156 RMX2163 RMX2161L1 RMX2163L1 RMX3031 IN2023 GM1917 RM6785 rm6785 wasabi}"
+
+          # Writes a boot-only RM6785 anykernel.sh (no leftover example ramdisk code from upstream)
+          write_anykernel_sh() {
+            local f="$1" i=0 d devlines=""
+            for d in ${AK_DEVICES}; do i=$((i + 1)); devlines+="device.name${i}=${d}"$'\n'; done
+            cat > "${f}" <<EOT
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
+          # global properties
+          properties() { '
+          kernel.string=${AK_KERNEL_STRING}
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          ${devlines}supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+
+          ### AnyKernel install
+          ## boot files attributes
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 \$RAMDISK/*;
+          set_perm_recursive 0 0 750 750 \$RAMDISK/init* \$RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=/dev/block/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install
+          dump_boot;
+
+          write_boot;
+          ## end boot install
+          EOT
+          }
+
+          # Inserts the banner (old AnyKernel zip style) into update-binary; returns 1 if the anchor is gone
+          patch_banner() {
+            local ub="$1" banner="${TMPDIR:-/tmp}/ak_banner.$$"
+            cat > "${banner}" <<EOT
+          ui_print "|----------------------------------------------|";
+          ui_print " ";
+          ui_print "|+-+-+-+-+-+-|  N E K O  -  K E R N E L  |+-+-++-+-+-|";
+          ui_print " ";
+          ui_print "|+-+-+-+-+-+-|\\\\___________________/|+-+-++-+-+-|";
+          ui_print " ";
+          ui_print "|+-+-+-+-+-+-+-+-+-|FOR RM6785|+-+-+-+-+-+-+-+-|";
+          ui_print " ";
+          ui_print "|+-+-+-+-+-+-+|By ${AK_AUTHOR}|+-+-+-+-+-+-|";
+          ui_print " ";
+          ui_print "|-------------|###################|------------|";
+          EOT
+            python3 - "${ub}" "${banner}" <<'PY' || { rm -f "${banner}"; return 1; }
+          import sys
+          ub, bn = sys.argv[1], sys.argv[2]
+          s = open(ub).read()
+          b = open(bn).read()
+          anchor = 'ui_print " " "AnyKernel3 by osm0sis @ xda-developers" " ";'
+          if anchor not in s:
+              sys.exit(1)
+          open(ub, "w").write(s.replace(anchor, b + "\n" + anchor, 1))
+          PY
+            rm -f "${banner}"
+          }
+
+          # ── stage the kernel image ──────────────────────────────────────────────────
+          rm -f AnyKernel/Image AnyKernel/Image.gz AnyKernel/Image.gz-dtb
+          rm -f AnyKernel/*.zip
+          cp "${KERNEL_IMG}" AnyKernel/
+
+          if [ "${AK_GENERATE:-0}" = "1" ]; then
+            write_anykernel_sh AnyKernel/anykernel.sh
+            patch_banner AnyKernel/META-INF/com/google/android/update-binary \
+              || log_warn "Banner not inserted (update-binary of this AnyKernel3 changed?). Zip is built without it."
+            log_info "anykernel.sh generated: '${AK_KERNEL_STRING}' | By ${AK_AUTHOR} | device check: ${AK_DEVICES%% *} ..."
+          fi
+
+          cd AnyKernel
+          TIMESTAMP=$(date +"%Y%m%d-%H%M")
+
+          if [ "${KSU_VARIANT}" != "Stock" ]; then
+            if [ "${SUSFS_ENABLED}" == "true" ]; then
+              ZIP_NAME="${ZIP_NAME_PREFIX}-RM6785-${KSU_VARIANT}-SUSFS"
+            else
+              ZIP_NAME="${ZIP_NAME_PREFIX}-RM6785-${KSU_VARIANT}"
+            fi
+          else
+            ZIP_NAME="${ZIP_NAME_PREFIX}-RM6785-Stock"
+          fi
+          [ "${NOMOUNT:-0}" = "1" ] && ZIP_NAME="${ZIP_NAME}-NoMount"
+          [ "${STABLE:-0}" = "1" ]  && ZIP_NAME="${ZIP_NAME}-Stable"
+          ZIP_NAME="${ZIP_NAME}-${TIMESTAMP}"
+
+          zip -r9 "${ZIP_NAME}.zip" . -x '*.git*' 'README.md' '*placeholder' > /dev/null 2>&1
+
+          {
+            echo "ZIP_NAME=${ZIP_NAME}"
+            echo "ANYKERNEL_DIR=$(pwd)"
+            echo "ZIP_PATH=$(pwd)/${ZIP_NAME}.zip"
+          } >> "$GITHUB_ENV"
+          log_success "Zip: ${ZIP_NAME}.zip ($(du -h "${ZIP_NAME}.zip" | cut -f1))"
+          CI_SCRIPT_PACKAGE_ZIP_EOF
+          cat > .ci-scripts/notify_success.sh <<'CI_SCRIPT_NOTIFY_SUCCESS_EOF'
+          #!/usr/bin/env bash
+          set -e
+          source "$(dirname "$0")/telegram_common.sh"
+
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
+            echo "Telegram secrets are not set, skipping."; exit 0
+          fi
+
+          duration_min=$(( BUILD_DURATION / 60 ))
+          duration_sec=$(( BUILD_DURATION % 60 ))
+
+          ZIP_ESC=$(esc "${ZIP_NAME}.zip")
+          BRANCH_ESC=$(esc "${KERNEL_BRANCH}")
+          COMMIT_MSG_ESC=$(esc "${KERNEL_COMMIT_MSG}")
+          COMMIT_URL_ESC=$(esc_url "${KERNEL_COMMIT_URL}")
+          TIME_ESC=$(esc "${duration_min}m ${duration_sec}s")
+          KSU_ESC=$(esc "${KSU_VARIANT}")
+          RUN_URL_ESC=$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+
+          # ── build variant (+ NoMount / Stable) ──────────────────────────────────────
+          VARIANT="${BUILD_VARIANT}"
+          if [ "${STABLE:-0}" = "1" ]; then
+            VARIANT="${VARIANT} (Stable)"
+          elif [ "${NOMOUNT:-0}" = "1" ]; then
+            VARIANT="${VARIANT} + NoMount (${NOMOUNT_REF} @ ${NOMOUNT_COMMIT:--})"
+          fi
+          VARIANT_ESC=$(esc "${VARIANT}")
+
+          # ── memory tuning summary ───────────────────────────────────────────────────
+          swap="off"
+          if [ "${SWAPPINESS_PATCH:-0}" = "1" ]; then
+            [ "${SWAPPINESS_LOCK:-0}" = "1" ] && swap="${SWAPPINESS_DEFAULT} (locked)" || swap="${SWAPPINESS_DEFAULT} (unlocked)"
+          fi
+          zr="off"
+          if [ "${LOWRAM:-0}" = "1" ]; then
+            zr="${ZRAM_COMP}"
+            [ "${ZRAM_MIN_PERCENT:-0}" != "0" ] && zr="${ZRAM_COMP}, min ${ZRAM_MIN_PERCENT}% RAM"
+          elif [ "${ZRAM_MIN_PERCENT:-0}" != "0" ]; then
+            zr="min ${ZRAM_MIN_PERCENT}% RAM"
+          fi
+
+          # ── toolchain ───────────────────────────────────────────────────────────────
+          case "${CLANG_TYPE:-}" in
+            aosp) TOOLCHAIN_NAME="AOSP" ;; neutron) TOOLCHAIN_NAME="Neutron" ;; greenforce) TOOLCHAIN_NAME="Greenforce" ;;
+            weebx) TOOLCHAIN_NAME="WeebX" ;; zyc) TOOLCHAIN_NAME="ZyC" ;; *) TOOLCHAIN_NAME="${CLANG_TOOLCHAIN:-Clang}" ;;
+          esac
+
+          if [ -n "${CLANG_PATH}" ] && [ -x "${CLANG_PATH}/clang" ]; then
+            CLANG_VER_STR=$("${CLANG_PATH}/clang" --version | head -n 1 | sed -n 's/.*clang version \([0-9.]*\).*/\1/p')
+            [ -z "$CLANG_VER_STR" ] && CLANG_VER_STR="unknown"
+            CLANG_ESC=$(esc "${TOOLCHAIN_NAME} ${CLANG_VER_STR}${CLANG_TAG:+ (tag ${CLANG_TAG})}")
+          else
+            CLANG_ESC=$(esc "N/A")
+          fi
+
+          CAPTION_FILE=$(mktemp)
+
+          printf '✅ *Build Successful* ✅\n\n'                          >> "$CAPTION_FILE"
+          printf '%s\n\n'              "${ZIP_ESC}"                     >> "$CAPTION_FILE"
+          printf '*Branch:* %s\n'      "${BRANCH_ESC}"                  >> "$CAPTION_FILE"
+          printf '*Commit:* [%s](%s)\n' "${COMMIT_MSG_ESC}" "${COMMIT_URL_ESC}" >> "$CAPTION_FILE"
+          printf '*Time:* %s\n'        "${TIME_ESC}"                    >> "$CAPTION_FILE"
+          printf '*Build Variant:* %s\n' "${VARIANT_ESC}"               >> "$CAPTION_FILE"
+          printf '*Kernel:* %s\n'      "$(esc "${KERNEL_RELEASE:-?}")"  >> "$CAPTION_FILE"
+          printf '*KernelSU:* %s\n'    "${KSU_ESC}"                     >> "$CAPTION_FILE"
+          printf '*Swappiness:* %s\n'  "$(esc "${swap}")"               >> "$CAPTION_FILE"
+          printf '*Zram:* %s\n'        "$(esc "${zr}")"                 >> "$CAPTION_FILE"
+          printf '*Clang:* %s\n'       "${CLANG_ESC}"                   >> "$CAPTION_FILE"
+
+          if [ "${KSU_VARIANT}" != "Stock" ]; then
+            printf '*Manager:* [Download](%s)\n' "$(esc_url "${KSU_REPO}/releases/latest")" >> "$CAPTION_FILE"
+          fi
+
+          if [ -n "${CUSTOM_NOTE}" ]; then
+            printf '\n*Note:* %s\n' "$(esc "${CUSTOM_NOTE}")"           >> "$CAPTION_FILE"
+          fi
+
+          printf '\n[View Run](%s)\n' "${RUN_URL_ESC}"                  >> "$CAPTION_FILE"
+
+          resp="$(curl -sS --max-time 300 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F chat_id="${TELEGRAM_CHAT_ID}" \
+            -F parse_mode="MarkdownV2" \
+            -F "caption=<${CAPTION_FILE}" \
+            -F "document=@${ZIP_PATH}" || true)"
+
+          rm -f "$CAPTION_FILE"
+
+          # A Telegram hiccup must not turn a good build red
+          if printf '%s' "$resp" | grep -q '"ok":true'; then
+            echo "ZIP sent to Telegram."
+          else
+            echo "::warning::Telegram rejected the upload (build itself succeeded): $resp"
+          fi
+          CI_SCRIPT_NOTIFY_SUCCESS_EOF
+          cat > .ci-scripts/notify_failure.sh <<'CI_SCRIPT_NOTIFY_FAILURE_EOF'
+          #!/usr/bin/env bash
+          set -e
+          source "$(dirname "$0")/telegram_common.sh"
+
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
+            echo "Telegram secrets are not set, skipping."; exit 0
+          fi
+
+          BRANCH=$(esc "${KERNEL_BRANCH:-${INPUT_KERNEL_BRANCH:-default}}")
+          RUN_URL_ESC=$(esc_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+
+          # The failure may have happened before the options were resolved: fall back to raw inputs
+          KSU_ON="${ENABLE_KSU:-${INPUT_ENABLE_KSU:-false}}"
+          if [ "${INPUT_STABLE_MODE:-false}" = "true" ]; then KSU_ON="false"; fi
+
+          if [ -n "${BUILD_VARIANT}" ]; then
+            VARIANT_TAG="${BUILD_VARIANT}"
+          elif [ "${KSU_ON}" == "true" ]; then
+            if [ "${INPUT_ENABLE_SUSFS}" == "true" ] && [ "${KSU_VARIANT_INPUT}" != "xxKSU" ]; then
+              VARIANT_TAG="KernelSU + SUSFS"
+            else
+              VARIANT_TAG="KernelSU"
+            fi
+          else
+            VARIANT_TAG="Normal"
+          fi
+
+          if [ "${INPUT_STABLE_MODE:-false}" = "true" ]; then
+            VARIANT_TAG="${VARIANT_TAG} (Stable)"
+          elif [ "${NOMOUNT:-$([ "${INPUT_ENABLE_NOMOUNT:-false}" = "true" ] && echo 1 || echo 0)}" = "1" ]; then
+            VARIANT_TAG="${VARIANT_TAG} + NoMount"
+          fi
+
+          MSG_FILE=$(mktemp)
+
+          printf '❌ *Build Failed* ❌\n\n'                 >> "$MSG_FILE"
+          printf '*Branch:* %s\n'        "${BRANCH}"       >> "$MSG_FILE"
+
+          if [ -n "${KERNEL_COMMIT_MSG}" ]; then
+            if [ -n "${KERNEL_COMMIT_URL}" ]; then
+              printf '*Commit:* [%s](%s)\n' "$(esc "${KERNEL_COMMIT_MSG}")" "$(esc_url "${KERNEL_COMMIT_URL}")" >> "$MSG_FILE"
+            else
+              printf '*Commit:* %s\n' "$(esc "${KERNEL_COMMIT_MSG}")" >> "$MSG_FILE"
+            fi
+          fi
+
+          printf '*Build Variant:* %s\n' "$(esc "${VARIANT_TAG}")" >> "$MSG_FILE"
+
+          if [ "${KSU_ON}" == "true" ]; then
+            printf '*KernelSU:* %s\n' "$(esc "${KSU_VARIANT_INPUT:-N/A}")" >> "$MSG_FILE"
+          fi
+
+          if [ -n "${CUSTOM_NOTE}" ]; then
+            printf '\n*Note:* %s\n' "$(esc "${CUSTOM_NOTE}")" >> "$MSG_FILE"
+          fi
+
+          printf '\n[View Logs](%s)\n' "${RUN_URL_ESC}"    >> "$MSG_FILE"
+
+          resp="$(curl -sS --max-time 60 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode="MarkdownV2" \
+            -d disable_web_page_preview=true \
+            --data-urlencode "text@${MSG_FILE}" || true)"
+
+          rm -f "$MSG_FILE"
+
+          if printf '%s' "$resp" | grep -q '"ok":true'; then
+            echo "Failure notification sent to Telegram."
+          else
+            echo "::warning::Telegram rejected the message: $resp"
+          fi
+          CI_SCRIPT_NOTIFY_FAILURE_EOF
+          chmod +x .ci-scripts/*.sh
+          for f in .ci-scripts/*.sh; do bash -n "$f"; done
 
       # ── Build environment ─────────────────────────────────────────────────
       - name: Set up Build Environment
@@ -303,31 +1535,23 @@ jobs:
 
       # ── Options ──────────────────────────────────────────────────────────
       - name: Resolve Build Options
-        run: bash .github/scripts/resolve_options.sh
+        run: bash .ci-scripts/resolve_options.sh
 
       # ── Kernel source ─────────────────────────────────────────────────────
       - name: Clone Kernel Source
         env:
           INPUT_PRIVATE_TOKEN: ${{ inputs.private_repo_token || secrets.KERNEL_REPO_TOKEN }}
-        run: bash .github/scripts/clone_kernel.sh
+        run: bash .ci-scripts/clone_kernel.sh
 
       # ── Clang toolchain ──────────────────────────────────────────────────
-      - name: Cache AOSP Clang Toolchain
-        if: inputs.clang_toolchain == 'AOSP'
-        uses: actions/cache@v4
-        id: cache-clang
-        with:
-          path: clang
-          key: clang-r596125
-
       - name: Clone AOSP Clang Toolchain
-        if: inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
+        if: inputs.clang_toolchain == 'AOSP'
         run: git clone --depth=1 "$CLANG_REPO" clang
 
       - name: Setup Clang Toolchain
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/setup_toolchain.sh
+        run: bash .ci-scripts/setup_toolchain.sh
 
       # ── AnyKernel3 ─────────────────────────
       - name: Clone AnyKernel3
@@ -335,22 +1559,22 @@ jobs:
 
       # ── Source patches (swappiness, VM tuning, DTB, zram) ─────────────────
       - name: Patch Kernel Source
-        run: bash .github/scripts/patch_kernel.sh
+        run: bash .ci-scripts/patch_kernel.sh
 
       # ── NoMount ───────────────────────────────────────────────────────────
       - name: Setup NoMount
-        run: bash .github/scripts/setup_nomount.sh
+        run: bash .ci-scripts/setup_nomount.sh
 
       # ── KernelSU / variant selection ──────────────────────────────────────
       - name: Setup KernelSU / Build Variant
         env:
           KSU_VARIANT_INPUT: ${{ inputs.ksu_variant }}
           ENABLE_SUSFS:      ${{ inputs.enable_susfs }}
-        run: bash .github/scripts/setup_ksu.sh
+        run: bash .ci-scripts/setup_ksu.sh
 
       # ── Build ─────────────────────────────────────────────────────────────
       - name: Build Kernel
-        run: bash .github/scripts/build_kernel.sh
+        run: bash .ci-scripts/build_kernel.sh
 
       - name: Upload Build Logs
         if: always()
@@ -364,13 +1588,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Check Build Output
-        run: bash .github/scripts/check_output.sh
+        run: bash .ci-scripts/check_output.sh
 
       # ── Package ──────────────────────────────────────────────────────────
       - name: Package with AnyKernel3
         env:
           ZIP_NAME_PREFIX: ${{ inputs.zip_name }}
-        run: bash .github/scripts/package_zip.sh
+        run: bash .ci-scripts/package_zip.sh
 
       - name: Upload ZIP
         uses: actions/upload-artifact@v4
@@ -385,11 +1609,11 @@ jobs:
         if: success()
         env:
           CUSTOM_NOTE: ${{ inputs.custom_note }}
-        run: bash .github/scripts/notify_success.sh
+        run: bash .ci-scripts/notify_success.sh
 
       - name: Send Failure Notification to Telegram
         if: failure()
         env:
           CUSTOM_NOTE:         ${{ inputs.custom_note }}
           KSU_VARIANT_INPUT:   ${{ inputs.ksu_variant }}
-        run: bash .github/scripts/notify_failure.sh
+        run: bash .ci-scripts/notify_failure.sh
