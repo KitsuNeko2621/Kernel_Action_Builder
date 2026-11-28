@@ -1,7 +1,7 @@
 name: Build Kernel (Universal)
 
-# NOTE: GitHub allows at most 25 workflow_dispatch inputs; this workflow uses 24.
-# Features merged in from the "experiment" workflow (NoMount, BakaSU-Inline, swappiness, zram,
+# NOTE: GitHub allows at most 25 workflow_dispatch inputs; this workflow uses 23.
+# Features merged in from the "experiment" workflow (NoMount, swappiness, zram,
 # low-RAM mode, VM tuning, localversion, stable mode, extra toolchains, list_tags) live in
 # .github/scripts/*.sh -- nothing is embedded in this file.
 
@@ -42,25 +42,19 @@ on:
         type: boolean
         default: false
       ksu_variant:
-        description: 'KernelSU Variant (only if KSU enabled). BakaSU-Inline = built-in BakaSU for a source that already has SUSFS + inline hooks (checked automatically)'
+        description: 'KernelSU Variant (only if KSU enabled). xxKSU / SukiSU / BakaSU'
         required: false
         type: choice
         options:
           - 'xxKSU'
           - 'SukiSU'
           - 'BakaSU'
-          - 'BakaSU-Inline'
         default: 'BakaSU'
       enable_susfs:
-        description: 'Enable SUSFS (BakaSU-Inline: false = root only, hiding features off, inline hook stays)'
+        description: 'Enable SUSFS (ignored by xxKSU)'
         required: false
         type: boolean
         default: false
-      bakasu_ref:
-        description: 'BakaSU-Inline: branch / tag / commit (pin a tag or commit for a reproducible build)'
-        required: false
-        type: string
-        default: 'main'
       enable_nomount:
         description: 'Enable NoMount (VFS path redirection; needs the NoMount metamodule + root to be useful)'
         required: true
@@ -242,7 +236,6 @@ jobs:
       INPUT_ENABLE_KSU: ${{ inputs.enable_ksu }}
       INPUT_KSU_VARIANT: ${{ inputs.ksu_variant }}
       INPUT_ENABLE_SUSFS: ${{ inputs.enable_susfs }}
-      INPUT_BAKASU_REF: ${{ inputs.bakasu_ref }}
       INPUT_ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
       INPUT_NOMOUNT_REF: ${{ inputs.nomount_ref }}
       INPUT_STABLE_MODE: ${{ inputs.stable_mode }}
