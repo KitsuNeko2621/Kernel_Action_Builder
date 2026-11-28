@@ -10,7 +10,7 @@ JOBS=$(nproc --all)
 
 export PATH="${CLANG_PATH}:${PATH}"
 export ARCH="${ARCH:-arm64}"
-export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-elohim-etz}"
+export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-KitsuNeko}"
 export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-GitHub-Actions}"
 
 # Always extract the error lines, even when the build dies half-way
