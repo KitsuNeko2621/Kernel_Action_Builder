@@ -155,7 +155,8 @@ permissions:
 jobs:
   # ── Toolchain tag listing (runs instead of the build when list_tags is on) ─
   list-tags:
-    if: ${{ inputs.list_tags }}
+    # compare as text: a boolean sent as the string "false" (API/CLI) is truthy in a plain expression
+    if: ${{ format('{0}', inputs.list_tags) == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -202,7 +203,7 @@ jobs:
             | jq -r '.[] | select(.draft|not) | "  " + .tag_name'
 
   build:
-    if: ${{ !inputs.list_tags }}
+    if: ${{ format('{0}', inputs.list_tags) != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 340
     env:
