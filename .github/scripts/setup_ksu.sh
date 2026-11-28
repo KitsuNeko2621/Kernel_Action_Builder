@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -e
+source "$(dirname "$0")/common.sh"
 cd "${KERNEL_DIR}"
 
 # ── Stock fallback ──────────────────────────────────────────────────────────
@@ -37,6 +38,9 @@ case "${KSU_VARIANT_INPUT}" in
     KSU_BRANCH="main"
     KSU_REPO="https://github.com/Baka-SU/BakaSU"
     SUSFS="${ENABLE_SUSFS}"
+    ;;
+  *)
+    log_error "Unknown KernelSU variant: '${KSU_VARIANT_INPUT}'"; exit 1
     ;;
 esac
 
