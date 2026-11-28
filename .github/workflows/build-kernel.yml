@@ -1,61 +1,126 @@
 name: Build Kernel (Universal)
 
+# NOTE: GitHub allows at most 25 workflow_dispatch inputs; this workflow uses 24.
+# Features merged in from the "experiment" workflow (NoMount, BakaSU-Inline, swappiness, zram,
+# low-RAM mode, VM tuning, localversion, stable mode, extra toolchains, list_tags) live in
+# .github/scripts/*.sh -- nothing is embedded in this file.
+
 on:
   workflow_dispatch:
     inputs:
+      # ── Kernel source ─────────────────────────────────────────────────────
       kernel_repo:
         description: 'Kernel Repository URL'
         required: true
         type: string
-        default: 'https://github.com/elohim-etz/android_kernel_realme_mt6785.git'
+        default: 'https://github.com/KitsuNeko2621/android_kernel_realme_mt6785_Elohim.git'
       kernel_branch:
-        description: 'Kernel Branch'
-        required: true
+        description: 'Kernel Branch (empty = repository default branch)'
+        required: false
         type: string
         default: 'lineage-24.0'
       defconfig:
-        description: 'Base defconfig name'
-        required: true
+        description: 'defconfig name(s), space-separated (empty = auto-detect)'
+        required: false
         type: string
         default: 'k85v1_64_k419_defconfig'
       config_fragments:
         description: 'Config fragments, space-separated (e.g. vendor/RM6785.config)'
-        required: true
+        required: false
         type: string
         default: 'vendor/RM6785.config'
       private_repo_token:
-        description: 'GitHub Token (only if kernel repo is private)'
+        description: 'GitHub Token (only if kernel repo is private; the KERNEL_REPO_TOKEN secret is used when empty)'
         required: false
         type: string
         default: ''
+
+      # ── Root ──────────────────────────────────────────────────────────────
       enable_ksu:
         description: 'Enable KernelSU'
         required: true
         type: boolean
         default: false
       ksu_variant:
-        description: 'KernelSU Variant (only if KSU enabled)'
+        description: 'KernelSU Variant (only if KSU enabled). BakaSU-Inline = built-in BakaSU for a source that already has SUSFS + inline hooks (checked automatically)'
         required: false
         type: choice
         options:
           - 'xxKSU'
           - 'SukiSU'
           - 'BakaSU'
+          - 'BakaSU-Inline'
         default: 'BakaSU'
       enable_susfs:
-        description: 'Enable SUSFS'
+        description: 'Enable SUSFS (BakaSU-Inline: false = root only, hiding features off, inline hook stays)'
         required: false
         type: boolean
         default: false
-      custom_note:
-        description: 'Custom build note (optional)'
-        required: false
-        default: ''
-      zip_name:
-        description: 'Kernel ZIP name prefix'
+      bakasu_ref:
+        description: 'BakaSU-Inline: branch / tag / commit (pin a tag or commit for a reproducible build)'
         required: false
         type: string
-        default: 'Yuri'
+        default: 'main'
+      enable_nomount:
+        description: 'Enable NoMount (VFS path redirection; needs the NoMount metamodule + root to be useful)'
+        required: true
+        type: boolean
+        default: true
+      nomount_ref:
+        description: 'NoMount: branch / tag / commit'
+        required: false
+        type: string
+        default: 'dev'
+
+      # ── Tuning ────────────────────────────────────────────────────────────
+      stable_mode:
+        description: 'Stable mode: disables KernelSU/SUSFS, NoMount, low-RAM mode, swappiness and VM/zram patches (baseline build for bootloop hunting)'
+        required: true
+        type: boolean
+        default: false
+      vm_tune:
+        description: 'RAM tuning for zram + gaming (page-cluster 0, watermark_scale_factor 30)'
+        required: true
+        type: boolean
+        default: true
+      swappiness_default:
+        description: 'Swappiness patch: default 0-200 (max raised to 200). Enter off to leave swappiness untouched'
+        required: false
+        type: string
+        default: '150'
+      swappiness_lock:
+        description: 'Lock swappiness (/proc/sys/vm/swappiness becomes 0444, root cgroup writes ignored). Ignored when swappiness is off'
+        required: true
+        type: boolean
+        default: true
+      lowram_mode:
+        description: 'Low-RAM mode + default zram compressor (off = disable low-RAM mode)'
+        required: true
+        type: choice
+        options:
+          - 'lz4'
+          - 'zstd'
+          - 'lz4hc'
+          - 'lzo-rle'
+          - 'off'
+        default: 'lz4'
+      zram_size_percent:
+        description: 'MINIMUM zram size, % of RAM (0 = unchanged, 100 = RAM size, max 200)'
+        required: true
+        type: string
+        default: '100'
+      aggressive_debug_off:
+        description: 'Low-RAM mode also disables SCHEDSTATS & KPROBES (a bit lighter, more bootloop risk). Default OFF'
+        required: true
+        type: boolean
+        default: false
+      localversion:
+        description: 'Kernel version name for uname -r, no spaces (empty = keep the kernel own string)'
+        required: false
+        type: string
+        default: '-NekoKernel'
+
+      # ── Toolchain ─────────────────────────────────────────────────────────
       clang_toolchain:
         description: 'Clang Toolchain'
         required: true
@@ -63,24 +128,141 @@ on:
         options:
           - 'AOSP'
           - 'Neutron'
+          - 'Greenforce'
+          - 'WeebX'
+          - 'ZyC'
         default: 'AOSP'
+      clang_version:
+        description: 'Greenforce: latest | major (e.g. 19) | release tag. ZyC: latest | 10-16 | tag. WeebX: latest | 16-19 | tag. AOSP/Neutron: ignored. Use the tag shown in Telegram to repeat a build exactly'
+        required: false
+        type: string
+        default: 'latest'
+      list_tags:
+        description: 'Only list the tags/branches of the selected toolchain (no build). Read the log, then re-run with clang_version set'
+        required: false
+        type: boolean
+        default: false
+
+      # ── Output ────────────────────────────────────────────────────────────
+      zip_name:
+        description: 'Kernel ZIP name prefix'
+        required: false
+        type: string
+        default: 'Yuri'
+      custom_note:
+        description: 'Custom build note (optional, included in Telegram)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  # ── Toolchain tag listing (runs instead of the build when list_tags is on) ─
+  list-tags:
+    if: ${{ inputs.list_tags }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: List toolchain tags
+        env:
+          TC: ${{ inputs.clang_toolchain }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TC="${TC,,}"
+          case "$TC" in
+            aosp)
+              echo "AOSP Clang is fixed to the crDroid prebuilt (clang-r596125); there is no tag choice."
+              exit 0 ;;
+            greenforce) repo="greenforce-project/greenforce_clang" ;;
+            zyc)
+              echo "ZyC Clang - set clang_version to: latest | 10-16 | one of the tags below"
+              B=https://raw.githubusercontent.com/ZyCromerZ/Clang/main
+              echo "  latest = $(curl -fsSL $B/Clang-main-link.txt | awk -F/ '{print $(NF-1)}')"
+              for v in 10 11 12 13 14 15 16; do
+                echo "  $v = $(curl -fsSL $B/Clang-$v-link.txt | awk -F/ '{print $(NF-1)}')"
+              done
+              echo "Latest tags (last 40):"
+              git ls-remote --tags https://github.com/ZyCromerZ/Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' | grep -E 'git-[0-9]+-release$|-release$' | grep -v sdclang \
+                | sed 's#^refs/tags/#  #' | tail -40
+              exit 0 ;;
+            weebx)
+              echo "WeebX Clang - set clang_version to: latest | 16 | 17 | 18 | 19 | one of the tags below"
+              echo "  latest = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/main/link.txt | awk -F/ '{print $(NF-1)}')"
+              for v in 16 17 18 19; do
+                echo "  $v = $(curl -fsSL https://raw.githubusercontent.com/XSans0/WeebX-Clang/main/release/$v.x/link.txt | awk -F/ '{print $(NF-1)}')"
+              done
+              echo "All tags:"
+              git ls-remote --tags https://github.com/XSans0/WeebX-Clang.git \
+                | awk '{print $2}' | grep -v '\^{}$' | sed 's#^refs/tags/#  #'
+              exit 0 ;;
+            *)
+              echo "Neutron always uses the latest version (antman); there is no tag choice."
+              exit 0 ;;
+          esac
+          echo "${TC} - latest release tags (set clang_version to a tag, or a major number):"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${repo}/releases?per_page=50" \
+            | jq -r '.[] | select(.draft|not) | "  " + .tag_name'
+
+  build:
+    if: ${{ !inputs.list_tags }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
     env:
       ARCH: arm64
       SUBARCH: arm64
       LC_ALL: C
+      DEBIAN_FRONTEND: noninteractive
       USE_CCACHE: 1
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CLANG_REPO: "https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r596125.git"
       ANYKERNEL_REPO: "https://github.com/elohim-etz/AnyKernel3.git"
       ANYKERNEL_BRANCH: "master"
-      CLANG_TOOLCHAIN: ${{ github.event.inputs.clang_toolchain }}
+      CLANG_TOOLCHAIN: ${{ inputs.clang_toolchain }}
+
+      # ── Build tweakables (edit here, not exposed as inputs) ──────────────
+      EXPECT_MTK_PLATFORM: "mt6785"   # abort early if CONFIG_MTK_PLATFORM differs; set "" for non-MediaTek kernels
+      DTB_ONLY: "1"                   # 1 = Image.gz-dtb holds only the main DTB (no .dtbo overlays appended)
+      PREFER_DTB_IMAGE: "1"           # 1 = package Image.gz-dtb when it exists, 0 = always plain Image.gz
+      REMOVE_LOCALVERSION_FILES: "1"  # 1 = delete localversion* files that would be appended to uname -r
+      DISABLE_LOCALVERSION_AUTO: "1"  # 1 = no -g<hash>/-dirty suffix
+      AK_GENERATE: "0"                # 1 = generate a boot-only RM6785 anykernel.sh + NEKO banner (for a plain osm0sis AnyKernel3)
+      AK_KERNEL_STRING: "Neko Kernel" # only used when AK_GENERATE=1
+      AK_AUTHOR: "KitsuNeko"          # only used when AK_GENERATE=1
+
+      # ── Workflow inputs, passed to the scripts as INPUT_* ────────────────
+      INPUT_KERNEL_REPO: ${{ inputs.kernel_repo }}
+      INPUT_KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      INPUT_DEFCONFIG: ${{ inputs.defconfig }}
+      INPUT_FRAGMENTS: ${{ inputs.config_fragments }}
+      INPUT_ENABLE_KSU: ${{ inputs.enable_ksu }}
+      INPUT_KSU_VARIANT: ${{ inputs.ksu_variant }}
+      INPUT_ENABLE_SUSFS: ${{ inputs.enable_susfs }}
+      INPUT_BAKASU_REF: ${{ inputs.bakasu_ref }}
+      INPUT_ENABLE_NOMOUNT: ${{ inputs.enable_nomount }}
+      INPUT_NOMOUNT_REF: ${{ inputs.nomount_ref }}
+      INPUT_STABLE_MODE: ${{ inputs.stable_mode }}
+      INPUT_VM_TUNE: ${{ inputs.vm_tune }}
+      INPUT_SWAPPINESS_DEFAULT: ${{ inputs.swappiness_default }}
+      INPUT_SWAPPINESS_LOCK: ${{ inputs.swappiness_lock }}
+      INPUT_LOWRAM_MODE: ${{ inputs.lowram_mode }}
+      INPUT_ZRAM_SIZE_PERCENT: ${{ inputs.zram_size_percent }}
+      INPUT_AGGRESSIVE_DEBUG_OFF: ${{ inputs.aggressive_debug_off }}
+      INPUT_LOCALVERSION: ${{ inputs.localversion }}
+      INPUT_CLANG_TOOLCHAIN: ${{ inputs.clang_toolchain }}
+      INPUT_CLANG_VERSION: ${{ inputs.clang_version }}
     steps:
-      # ── Checkout ──────────────────────────────────────────────────────────
+      # ── Runner prep ───────────────────────────────────────────────────────
+      - name: Free Up Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
       - name: Checkout Workflow Repository
         uses: actions/checkout@v4
         with:
@@ -95,7 +277,11 @@ jobs:
             build-essential bc bison flex libssl-dev \
             gcc clang lld libncurses5-dev git zip unzip \
             curl wget time ccache libelf-dev libfdt-dev \
-            python3 python3-pip
+            python3 python3-pip cpio xz-utils zstd lz4 jq \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          # ld.lld shipped with WeebX/ZyC/Greenforce needs libxml2; the package name differs per Ubuntu release
+          sudo apt-get install -y --no-install-recommends libxml2 \
+            || sudo apt-get install -y --no-install-recommends libxml2-16 || true
 
       # ── ccache ───────────────────────────────────────────────
       - name: Cache ccache
@@ -108,48 +294,11 @@ jobs:
 
       - name: Configure ccache
         run: |
+          mkdir -p "$HOME/.ccache"
           ccache --max-size=5G
           ccache --set-config=compression=true
           ccache --set-config=compression_level=1
           echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-
-      # ── Kernel source ─────────────────────────────────────────────────────
-      - name: Clone Kernel Source
-        env:
-          INPUT_KERNEL_REPO:   ${{ github.event.inputs.kernel_repo }}
-          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
-          INPUT_PRIVATE_TOKEN: ${{ github.event.inputs.private_repo_token }}
-          INPUT_DEFCONFIG:     ${{ github.event.inputs.defconfig }}
-          INPUT_FRAGMENTS:     ${{ github.event.inputs.config_fragments }}
-        run: bash .github/scripts/clone_kernel.sh
-
-      # ── Clang toolchain ──────────────────────────────────────────────────
-      - name: Cache AOSP Clang Toolchain
-        if: github.event.inputs.clang_toolchain == 'AOSP'
-        uses: actions/cache@v4
-        id: cache-clang
-        with:
-          path: clang
-          key: clang-r596125
-
-      - name: Clone AOSP Clang Toolchain
-        if: github.event.inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
-        run: git clone --depth=1 "$CLANG_REPO" clang
-
-      - name: Setup Clang Toolchain
-        run: bash .github/scripts/setup_toolchain.sh
-
-      # ── AnyKernel3 ─────────────────────────
-      - name: Clone AnyKernel3
-        run: git clone --depth=1 "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH" AnyKernel
-
-      # ── KernelSU / variant selection ──────────────────────────────────────
-      - name: Setup KernelSU / Build Variant
-        env:
-          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
-          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
-          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
-        run: bash .github/scripts/setup_ksu.sh
 
       # ── Logs ─────────────────────────────────────────────────────────────
       - name: Prepare Log Paths
@@ -158,10 +307,55 @@ jobs:
           echo "BUILD_LOG=$GITHUB_WORKSPACE/logs/build.log"   >> $GITHUB_ENV
           echo "ERROR_LOG=$GITHUB_WORKSPACE/logs/errors.log"  >> $GITHUB_ENV
 
+      # ── Options ──────────────────────────────────────────────────────────
+      - name: Resolve Build Options
+        run: bash .github/scripts/resolve_options.sh
+
+      # ── Kernel source ─────────────────────────────────────────────────────
+      - name: Clone Kernel Source
+        env:
+          INPUT_PRIVATE_TOKEN: ${{ inputs.private_repo_token || secrets.KERNEL_REPO_TOKEN }}
+        run: bash .github/scripts/clone_kernel.sh
+
+      # ── Clang toolchain ──────────────────────────────────────────────────
+      - name: Cache AOSP Clang Toolchain
+        if: inputs.clang_toolchain == 'AOSP'
+        uses: actions/cache@v4
+        id: cache-clang
+        with:
+          path: clang
+          key: clang-r596125
+
+      - name: Clone AOSP Clang Toolchain
+        if: inputs.clang_toolchain == 'AOSP' && steps.cache-clang.outputs.cache-hit != 'true'
+        run: git clone --depth=1 "$CLANG_REPO" clang
+
+      - name: Setup Clang Toolchain
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/setup_toolchain.sh
+
+      # ── AnyKernel3 ─────────────────────────
+      - name: Clone AnyKernel3
+        run: git clone --depth=1 "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH" AnyKernel
+
+      # ── Source patches (swappiness, VM tuning, DTB, zram) ─────────────────
+      - name: Patch Kernel Source
+        run: bash .github/scripts/patch_kernel.sh
+
+      # ── NoMount ───────────────────────────────────────────────────────────
+      - name: Setup NoMount
+        run: bash .github/scripts/setup_nomount.sh
+
+      # ── KernelSU / variant selection ──────────────────────────────────────
+      - name: Setup KernelSU / Build Variant
+        env:
+          KSU_VARIANT_INPUT: ${{ inputs.ksu_variant }}
+          ENABLE_SUSFS:      ${{ inputs.enable_susfs }}
+        run: bash .github/scripts/setup_ksu.sh
+
       # ── Build ─────────────────────────────────────────────────────────────
       - name: Build Kernel
-        env:
-          ENABLE_KSU: ${{ github.event.inputs.enable_ksu }}
         run: bash .github/scripts/build_kernel.sh
 
       - name: Upload Build Logs
@@ -173,6 +367,7 @@ jobs:
             ${{ env.BUILD_LOG }}
             ${{ env.ERROR_LOG }}
           retention-days: 7
+          if-no-files-found: ignore
 
       - name: Check Build Output
         run: bash .github/scripts/check_output.sh
@@ -180,22 +375,27 @@ jobs:
       # ── Package ──────────────────────────────────────────────────────────
       - name: Package with AnyKernel3
         env:
-          ZIP_NAME_PREFIX: ${{ github.event.inputs.zip_name }}
+          ZIP_NAME_PREFIX: ${{ inputs.zip_name }}
         run: bash .github/scripts/package_zip.sh
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-zip-${{ github.run_number }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 14
+          if-no-files-found: error
 
       # ── Telegram notifications ────────────────────────────────────────────
       - name: Send Kernel ZIP to Telegram
         if: success()
         env:
-          CUSTOM_NOTE: ${{ github.event.inputs.custom_note }}
+          CUSTOM_NOTE: ${{ inputs.custom_note }}
         run: bash .github/scripts/notify_success.sh
 
       - name: Send Failure Notification to Telegram
         if: failure()
         env:
-          CUSTOM_NOTE:       ${{ github.event.inputs.custom_note }}
-          ENABLE_KSU:        ${{ github.event.inputs.enable_ksu }}
-          KSU_VARIANT_INPUT: ${{ github.event.inputs.ksu_variant }}
-          ENABLE_SUSFS:      ${{ github.event.inputs.enable_susfs }}
-          INPUT_KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+          CUSTOM_NOTE:         ${{ inputs.custom_note }}
+          KSU_VARIANT_INPUT:   ${{ inputs.ksu_variant }}
         run: bash .github/scripts/notify_failure.sh
